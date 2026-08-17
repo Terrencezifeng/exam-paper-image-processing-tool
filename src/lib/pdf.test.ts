@@ -7,7 +7,7 @@ describe('PDF filename safety', () => {
   })
 
   it('uses a safe default and avoids duplicate extensions', () => {
-    expect(sanitizePdfFilename('   ')).toBe('净化试卷.pdf')
+    expect(sanitizePdfFilename('   ')).toBe('整理后的试卷.pdf')
     expect(sanitizePdfFilename('练习.PDF')).toBe('练习.pdf')
   })
 })

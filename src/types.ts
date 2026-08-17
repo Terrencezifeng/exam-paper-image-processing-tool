@@ -3,13 +3,21 @@ export type Point = { x: number; y: number }
 export type PageStatus =
   | 'queued'
   | 'processing'
-  | 'review'
   | 'ready'
   | 'failed'
   | 'cancelled'
 
-export type ColorMode = 'color' | 'mono'
 export type EditTool = 'eraser' | 'restore'
+export type EditorTool = 'pan' | EditTool
+export type Rotation = 0 | 90 | 180 | 270
+export type InferenceBackend = 'webgpu' | 'wasm' | 'unavailable'
+export type ProcessingStage =
+  | 'queued'
+  | 'decoding'
+  | 'orientation'
+  | 'boundary'
+  | 'enhancement'
+  | 'compositing'
 
 export type Stroke = {
   id: string
@@ -18,12 +26,15 @@ export type Stroke = {
   points: Point[]
 }
 
-export type ReviewRegion = {
-  x: number
-  y: number
-  width: number
-  height: number
-  reason: string
+export type ProcessingDiagnostics = {
+  autoRotation: Rotation
+  effectiveRotation: Rotation
+  orientationConfidence: number
+  boundaryConfidence: number
+  boundaryAccepted: boolean
+  orientationBackend: InferenceBackend
+  orientationModelVersion?: string
+  warning?: string
 }
 
 export type WorksheetPage = {
@@ -31,37 +42,56 @@ export type WorksheetPage = {
   name: string
   source: Blob
   sourceUrl: string
+  sourcePreview?: Blob
+  sourcePreviewUrl?: string
+  sourceWidth: number
+  sourceHeight: number
   width: number
   height: number
   status: PageStatus
   progress: number
-  rotation: 0 | 90 | 180 | 270
+  rotation: Rotation
+  autoRotation: Rotation
   corners: Point[]
-  colorMode: ColorMode
+  processingStage: ProcessingStage
   enhanced?: Blob
   enhancedUrl?: string
   processed?: Blob
   processedUrl?: string
-  reviewRegions: ReviewRegion[]
+  diagnostics: ProcessingDiagnostics
   strokes: Stroke[]
   undoneStrokes: Stroke[]
   error?: string
 }
 
 export type ExportSettings = {
-  colorMode: ColorMode
   quality: 'clear' | 'standard' | 'small'
   margin: 6 | 12 | 18
   filename: string
 }
 
+export type PersistedBinary = Blob | { bytes: ArrayBuffer; type: string }
+
 export type PersistedPage = Omit<
   WorksheetPage,
-  'sourceUrl' | 'enhancedUrl' | 'processedUrl'
->
+  | 'source'
+  | 'sourcePreview'
+  | 'enhanced'
+  | 'processed'
+  | 'sourceUrl'
+  | 'sourcePreviewUrl'
+  | 'enhancedUrl'
+  | 'processedUrl'
+> & {
+  source: PersistedBinary
+  sourcePreview?: PersistedBinary
+  enhanced?: PersistedBinary
+  processed?: PersistedBinary
+}
 
 export type PersistedTask = {
   id: string
+  version: 3
   updatedAt: number
   pages: PersistedPage[]
 }

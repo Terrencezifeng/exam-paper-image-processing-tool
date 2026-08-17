@@ -1,40 +1,39 @@
-# MVP 改动验证报告
+# 试卷整理与手动擦除验证报告
 
-## 影响与风险
+## 当前范围
 
-- 行为变化：从空仓库新增完整桌面 Web MVP，覆盖本地图片导入、处理、编辑、恢复和 PDF 导出。
-- 风险等级：高。原因是涉及用户文件、浏览器持久化、复杂像素处理、第三方依赖和用户可下载产物，且真实图像质量数据尚未到位。
-- 受影响边界：文件输入、Canvas 像素管线、IndexedDB、Blob URL、PDF 下载、桌面响应式 UI。
+- 生产流程只包含本地方向识别、保守裁边、透视校正、灰度增强、手动擦除/恢复和 A4 PDF 导出。
+- 自动手写识别、自动擦除、待复核遮罩及外部 OCR API 均不参与应用运行和生产构建。
+- 图片、手工笔画、恢复数据和 PDF 全部留在浏览器；Linux 服务器只提供 HTTPS 静态资源。
 
-## 验证证据
+## 自动验证
 
-| 状态 | 命令或手动检查 | 范围 | 结果 |
-| --- | --- | --- | --- |
-| 通过 | `npm run typecheck` | TypeScript 应用、配置与 E2E 类型 | 无错误 |
-| 通过 | `npm run lint` | TypeScript/React/测试与配置 | 无错误 |
-| 通过 | `npm test` | 文件校验、透视数学、应用空状态、PDF 文件名 | 单元/组件测试通过 |
-| 通过 | `npm run build` | TypeScript 生产构建和按需分包 | 构建成功 |
-| 通过 | `npm run e2e` | Chromium 上传入口与核心流程 | 端到端测试通过 |
-| 通过 | 实际浏览器检查 | 1280×720 与 1100×720 上传页、工作台、复核区域和工具面板 | 无横向溢出；按钮具备可访问名称；工作台布局稳定 |
-| 通过 | `npm audit` | 锁定的 npm 依赖 | 0 个已知漏洞 |
+| 状态 | 命令或检查 | 范围 |
+| --- | --- | --- |
+| 通过 | `npm run lint` | React、TypeScript、Worker、测试与配置 |
+| 通过 | `npm run typecheck` | 应用、Worker、评测配置和 E2E 类型 |
+| 通过 | `npm test` | 解码分流、几何、存储 v2→v3、PDF 和 Worker 协议 |
+| 通过 | `npm run build` | 生产构建、Worker、方向模型和 HEIC 按需分包 |
+| 通过 | `npm run e2e` | 桌面 Chromium、Android Chromium、iPhone WebKit 工作流 |
+| 通过 | `npm run eval:samples` | 4 组授权 clean/written 样张及旋转变体 |
+| 通过 | `npm run verify:models` | 生产模型仅包含约 0.04 MB 的方向模型 |
+| 通过 | `npm audit --audit-level=moderate --registry=https://registry.npmjs.org` | 0 个已知漏洞 |
 
-## 失败分析与修复
+## 样张结论
 
-- 初次安装使用 TypeScript 7，超出 `typescript-eslint` 的正式兼容范围；改为 TypeScript 6.0.3 后正常安装。
-- 初次 E2E 受沙箱端口权限和缺少 Chromium 运行时阻塞；获准启动本地服务器并安装测试浏览器后通过。
-- 初次测试配置误收集 Playwright 用例；将 `tests/e2e` 从 Vitest 排除并纳入 Node 类型配置。
-- 初次构建将 PDF 库打进首屏；改为点击导出时动态加载，首屏主包降至约 227 kB（压缩前）。
-- 实际 UI 检查发现页间导航误改页面顺序、清空任务缺少确认和复核框过大；均已修复。
+- 4 张 clean 页均能转正并以平均四角误差不超过 0.04 的结果完成可信裁边。
+- sample-01、sample-02 written 页可可信裁边；sample-03、sample-04 written 页会拒绝可疑轮廓、保留整图并提示手动调角，未丢失答案区。
+- 增强图与导出基线均为灰度；印刷保护区域在未手动编辑时保持不变。
+- 真实样张已在桌面 Chromium、Android Chromium 和 iPhone WebKit 视口完成非空画布与响应式截图检查，无横向溢出或工具栏遮挡。
 
-## 跳过、受阻或不可用的检查
+## 兼容与恢复
 
-- 真实试卷擦除准确率：授权样张尚未提供，无法计算黑色手写自动擦除率与正确复核覆盖率。
-- 20 张 12 MP 压力测试：缺少代表性样张与基准设备测量；当前仅设置输入、像素和处理边长上限。
-- Edge 独立 E2E：当前自动化仅运行 Chromium；Edge 与 Chrome 共享 Chromium 内核，但仍需发布前实机抽查。
-- 打印机实体输出：已按 A4 尺寸生成 PDF，尚未在实体打印机核对页边距和可读性。
+- 浏览器支持的 JPG、PNG、WebP 及 HEIC/HEIF 优先原生解码；原生失败且确认是 HEIC/HEIF 时才按需加载 `heic-to/csp`。
+- WebKit 不支持 Worker `OffscreenCanvas` 时回退主线程串行处理；IndexedDB 不接受 Blob 时改存 ArrayBuffer，并在恢复时还原 Blob。
+- v2 任务只迁移擦除前 `enhanced` 图，忽略旧自动遮罩；v3 保存页面顺序、增强基线和手工笔画。
+- 20 页 E2E 使用微型合成 PNG 验证队列、排序、恢复和 PDF 页数，不代表 12 MP 性能结论。
 
-## 残余风险
+## 实机待验
 
-- 黑色手写与印刷字具有相同颜色和相似笔画，仅靠当前启发式规则可能误擦印刷内容或漏擦手写；复核框和恢复笔只能降低影响，不能替代真实样张调优。
-- 像素处理仍在主线程，高分辨率批量任务可能短暂阻塞 UI；后续应迁移到 Web Worker/OffscreenCanvas。
-- IndexedDB 容量由浏览器和设备决定，20 张接近限制的图片可能触发配额不足；应用会提示但无法保证刷新恢复。
+- 仓库暂缺可再分发的真实 HEIC/HEIF 样张；自动测试已覆盖原生优先和本地回退分流，真实文件解码及连续多图内存曲线仍需设备验收。
+- 12 MP 首张缩略图 3 秒、20 张高分辨率图片的手机内存峰值、实体 A4 打印和 Safari 下载行为需在目标手机上复测。

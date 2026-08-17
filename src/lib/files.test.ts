@@ -7,8 +7,13 @@ describe('file validation', () => {
     expect(validateFile(file).ok).toBe(true)
   })
 
+  it('accepts HEIC by MIME type or extension', () => {
+    expect(validateFile(new File(['image'], 'paper.heic', { type: 'image/heic' })).ok).toBe(true)
+    expect(validateFile(new File(['image'], 'paper.HEIF', { type: '' })).ok).toBe(true)
+  })
+
   it('rejects unsupported and empty files with a reason', () => {
-    const unsupported = new File(['image'], 'paper.heic', { type: 'image/heic' })
+    const unsupported = new File(['image'], 'paper.pdf', { type: 'application/pdf' })
     const empty = new File([], 'empty.png', { type: 'image/png' })
     expect(validateFile(unsupported)).toMatchObject({ ok: false })
     expect(validateFile(empty)).toMatchObject({ ok: false, reason: '文件为空' })

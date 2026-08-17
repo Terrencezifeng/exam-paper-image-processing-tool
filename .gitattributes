@@ -1,0 +1,6 @@
+tests/fixtures/worksheets/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/worksheets/**/*.jpeg filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/worksheets/**/*.png filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/worksheets/**/*.webp filter=lfs diff=lfs merge=lfs -text
+public/models/**/*.onnx filter=lfs diff=lfs merge=lfs -text
+tools/model/artifacts/**/*.onnx filter=lfs diff=lfs merge=lfs -text

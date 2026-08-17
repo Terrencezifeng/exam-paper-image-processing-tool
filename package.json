@@ -10,11 +10,17 @@
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
     "test:watch": "vitest",
-    "e2e": "playwright test"
+    "e2e": "node scripts/run-e2e.mjs",
+    "train:models": "python tools/model/train_models.py",
+    "train:handwriting:research": "python tools/model/train_models.py --include-handwriting-research",
+    "verify:models": "node scripts/verify-model-assets.mjs",
+    "eval:samples": "node scripts/evaluate-samples.mjs"
   },
   "dependencies": {
+    "heic-to": "^1.5.2",
     "jspdf": "4.2.1",
     "lucide-react": "1.31.0",
+    "onnxruntime-web": "^1.22.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },

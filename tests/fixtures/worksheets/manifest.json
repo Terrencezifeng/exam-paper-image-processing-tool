@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "authorization": "Each sample is included only after the user explicitly confirms public repository redistribution permission.",
+  "samples": [
+    {
+      "id": "sample-01",
+      "group": "portrait-standard-baseline",
+      "clean": "sample-01/sample-01.clean.jpg",
+      "written": "sample-01/sample-01.written.jpg",
+      "mask": "sample-01/sample-01.mask.png",
+      "expectedRotation": 0,
+      "expectedCorners": [
+        { "x": 0.064, "y": 0.046 },
+        { "x": 0.912, "y": 0.057 },
+        { "x": 0.966, "y": 0.973 },
+        { "x": 0.024, "y": 0.957 }
+      ],
+      "protectedRegions": [
+        { "x": 0.21, "y": 0.14, "width": 0.58, "height": 0.10 },
+        { "x": 0.17, "y": 0.37, "width": 0.50, "height": 0.08 },
+        { "x": 0.34, "y": 0.78, "width": 0.36, "height": 0.14 }
+      ],
+      "redistributionAuthorized": true,
+      "authorizationNote": "User explicitly confirmed on 2026-08-14 that these worksheet images may be redistributed with the public repository.",
+      "maskReviewStatus": "manually-reviewed",
+      "capture": {
+        "orientation": "portrait",
+        "lighting": "mostly even indoor light",
+        "resolution": "3072x4094",
+        "handwriting": "black 0.38/0.5 mm pen; letters, circles, and print-overlap cases"
+      }
+    },
+    {
+      "id": "sample-02",
+      "group": "tables-flowchart-perspective",
+      "clean": "sample-02/sample-02.clean.jpg",
+      "written": "sample-02/sample-02.written.jpg",
+      "mask": "sample-02/sample-02.mask.png",
+      "expectedRotation": 0,
+      "expectedCorners": [
+        { "x": 0.081, "y": 0.011 },
+        { "x": 0.957, "y": 0.024 },
+        { "x": 0.965, "y": 0.975 },
+        { "x": 0.026, "y": 0.985 }
+      ],
+      "protectedRegions": [
+        { "x": 0.265, "y": 0.185, "width": 0.510, "height": 0.130 },
+        { "x": 0.350, "y": 0.555, "width": 0.370, "height": 0.355 },
+        { "x": 0.155, "y": 0.300, "width": 0.670, "height": 0.300 }
+      ],
+      "orientationVariants": [
+        {
+          "file": "sample-02/sample-02.written-landscape.jpg",
+          "expectedRotation": 0,
+          "expectedCorners": [
+            { "x": 0.215, "y": 0.015 },
+            { "x": 0.744, "y": 0.006 },
+            { "x": 0.733, "y": 0.974 },
+            { "x": 0.211, "y": 0.978 }
+          ],
+          "note": "Landscape camera frame with upright page text; validates wide framing, background clutter, and perspective, not a 90-degree text rotation."
+        }
+      ],
+      "redistributionAuthorized": true,
+      "authorizationNote": "User explicitly confirmed on 2026-08-14 that all three sample-02 images may be redistributed with the public repository.",
+      "maskReviewStatus": "pending-manual-review",
+      "capture": {
+        "orientation": "portrait pair plus landscape-frame variant",
+        "lighting": "indoor mixed background",
+        "resolution": "3072x4094 pair; 4096x3072 variant",
+        "handwriting": "black pen; letters, circles, underlines, arrows, notes, and flowchart overlap"
+      }
+    },
+    {
+      "id": "sample-03",
+      "group": "shadow-gradient-long-writing",
+      "clean": "sample-03/sample-03.clean.jpg",
+      "written": "sample-03/sample-03.written.jpg",
+      "mask": "sample-03/sample-03.mask.png",
+      "expectedRotation": 0,
+      "expectedCorners": [
+        { "x": 0.063, "y": 0.025 },
+        { "x": 0.914, "y": 0.037 },
+        { "x": 0.988, "y": 0.996 },
+        { "x": 0.002, "y": 0.996 }
+      ],
+      "protectedRegions": [
+        { "x": 0.165, "y": 0.075, "width": 0.770, "height": 0.365 },
+        { "x": 0.180, "y": 0.435, "width": 0.720, "height": 0.105 },
+        { "x": 0.435, "y": 0.930, "width": 0.130, "height": 0.045 }
+      ],
+      "redistributionAuthorized": true,
+      "authorizationNote": "User explicitly confirmed on 2026-08-14 that both sample-03 images may be redistributed with the public repository.",
+      "privacySanitization": {
+        "sourceExifRemoved": true,
+        "burnedInCameraFooterRemoved": true,
+        "sourceFilesModified": false
+      },
+      "maskReviewStatus": "manually-reviewed",
+      "capture": {
+        "orientation": "portrait",
+        "lighting": "soft shadow with a vertical brightness gradient",
+        "resolution": "3072x3900 sanitized repository copies",
+        "handwriting": "black pen; circled print, answers, underlines, arrows, margin note, and multi-line free response"
+      }
+    },
+    {
+      "id": "sample-04",
+      "group": "dense-print-handwriting-overlap",
+      "clean": "sample-04/sample-04.clean.jpg",
+      "written": "sample-04/sample-04.written.jpg",
+      "mask": "sample-04/sample-04.mask.png",
+      "expectedRotation": 0,
+      "expectedCorners": [
+        { "x": 0.079, "y": 0.026 },
+        { "x": 0.920, "y": 0.047 },
+        { "x": 0.974, "y": 0.975 },
+        { "x": 0.043, "y": 0.956 }
+      ],
+      "protectedRegions": [
+        { "x": 0.190, "y": 0.115, "width": 0.620, "height": 0.120 },
+        { "x": 0.155, "y": 0.240, "width": 0.730, "height": 0.440 },
+        { "x": 0.330, "y": 0.710, "width": 0.350, "height": 0.170 }
+      ],
+      "redistributionAuthorized": true,
+      "authorizationNote": "User explicitly confirmed on 2026-08-14 that both sample-04 images may be redistributed with the public repository.",
+      "privacySanitization": {
+        "sourceExifRemoved": true,
+        "burnedInCameraFooterRemoved": false,
+        "sourceFilesModified": false
+      },
+      "maskReviewStatus": "manually-reviewed",
+      "capture": {
+        "orientation": "portrait",
+        "lighting": "soft indoor light with page curvature and show-through",
+        "resolution": "3072x4094 sanitized repository copies",
+        "handwriting": "black pen; print-overlapping circles and lines, dense Chinese notes, arithmetic, digits, and a freehand drawing"
+      }
+    }
+  ]
+}

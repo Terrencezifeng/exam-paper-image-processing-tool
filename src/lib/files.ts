@@ -2,15 +2,26 @@ export const MAX_FILES = 20
 export const MAX_FILE_BYTES = 20 * 1024 * 1024
 export const MAX_PIXELS = 40_000_000
 
-const SUPPORTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
+const SUPPORTED_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+  'image/heic-sequence',
+  'image/heif-sequence',
+])
+const SUPPORTED_EXTENSION = /\.(jpe?g|png|webp|heic|heif)$/i
+
+export const IMAGE_ACCEPT = 'image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif'
 
 export type FileValidation =
   | { ok: true; file: File }
   | { ok: false; file: File; reason: string }
 
 export function validateFile(file: File): FileValidation {
-  if (!SUPPORTED_TYPES.has(file.type)) {
-    return { ok: false, file, reason: '仅支持 JPG、PNG 或 WebP 图片' }
+  if (!SUPPORTED_TYPES.has(file.type.toLowerCase()) && !SUPPORTED_EXTENSION.test(file.name)) {
+    return { ok: false, file, reason: '仅支持 JPG、PNG、WebP、HEIC 或 HEIF 图片' }
   }
   if (file.size === 0) {
     return { ok: false, file, reason: '文件为空' }

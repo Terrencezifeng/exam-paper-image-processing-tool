@@ -9,5 +9,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "eslint.config.js", "playwright.config.ts", "tests/e2e"]
+  "include": ["vite.config.ts", "eslint.config.js", "playwright.config.ts", "playwright.eval.config.ts", "tests/e2e", "tests/evaluation"]
 }

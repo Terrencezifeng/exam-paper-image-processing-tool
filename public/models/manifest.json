@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "orientation": {
+    "status": "ready",
+    "version": "black-v1-seed-20250814-epochs-6",
+    "url": "/models/document-orientation.int8.onnx",
+    "sha256": "cabd0b74f4b61c15a49526889ca6a52ac6773de8851c96ea664ef9ca6173023f",
+    "sizeBytes": 41104,
+    "inputName": "input",
+    "outputName": "output",
+    "inputSize": 224
+  }
+}

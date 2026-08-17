@@ -1,33 +1,73 @@
 import { MAX_PIXELS } from './files'
-import type { ColorMode, Point, ReviewRegion, Stroke } from '../types'
+import { predictOrientation } from './model-runtime'
+import type {
+  Point,
+  ProcessingDiagnostics,
+  ProcessingStage,
+  Rotation,
+  Stroke,
+} from '../types'
 
 const MAX_PROCESS_EDGE = 2400
+const ORIENTATION_ACCEPTANCE = 0.82
+const BOUNDARY_ACCEPTANCE = 0.72
+
+type CanvasLike = HTMLCanvasElement | OffscreenCanvas
+type Context2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
 
 export type ProcessResult = {
+  sourcePreview: Blob
+  sourceWidth: number
+  sourceHeight: number
   enhanced: Blob
   processed: Blob
   width: number
   height: number
   corners: Point[]
-  reviewRegions: ReviewRegion[]
+  diagnostics: ProcessingDiagnostics
 }
 
 export type ProcessOptions = {
   corners?: Point[]
-  rotation?: 0 | 90 | 180 | 270
-  colorMode?: ColorMode
+  rotation?: Rotation
   signal?: AbortSignal
-  onProgress?: (progress: number) => void
+  onProgress?: (progress: number, stage: ProcessingStage) => void
+}
+
+export type BoundaryDetection = {
+  corners: Point[]
+  confidence: number
+  accepted: boolean
 }
 
 function assertActive(signal?: AbortSignal) {
   if (signal?.aborted) throw new DOMException('处理已取消', 'AbortError')
 }
 
-function canvasToBlob(canvas: HTMLCanvasElement, quality = 0.92): Promise<Blob> {
+function createCanvas(width: number, height: number): CanvasLike {
+  if (typeof document !== 'undefined') {
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    return canvas
+  }
+  return new OffscreenCanvas(width, height)
+}
+
+function context2d(canvas: CanvasLike, frequent = false): Context2D {
+  const context = canvas.getContext('2d', frequent ? { willReadFrequently: true } : undefined)
+  if (!context) throw new Error('浏览器无法创建图像画布')
+  return context as Context2D
+}
+
+function canvasToBlob(canvas: CanvasLike, quality = 0.92): Promise<Blob> {
+  if (typeof OffscreenCanvas !== 'undefined' && canvas instanceof OffscreenCanvas) {
+    return canvas.convertToBlob({ type: 'image/jpeg', quality })
+  }
   return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error('无法生成处理后的图片'))),
+    const htmlCanvas = canvas as HTMLCanvasElement
+    htmlCanvas.toBlob(
+      (blob: Blob | null) => (blob ? resolve(blob) : reject(new Error('无法生成处理后的图片'))),
       'image/jpeg',
       quality,
     )
@@ -35,7 +75,15 @@ function canvasToBlob(canvas: HTMLCanvasElement, quality = 0.92): Promise<Blob> 
 }
 
 export async function decodeBlob(blob: Blob): Promise<ImageBitmap> {
-  const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' })
+  let bitmap: ImageBitmap
+  try {
+    bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' })
+  } catch (error) {
+    const { isHeic, heicTo } = await import('heic-to/csp')
+    const candidate = new File([blob], 'worksheet', { type: blob.type })
+    if (!(await isHeic(candidate))) throw error
+    bitmap = await heicTo({ blob, type: 'bitmap', options: { imageOrientation: 'from-image' } })
+  }
   if (bitmap.width * bitmap.height > MAX_PIXELS) {
     bitmap.close()
     throw new Error('图片像素过大，请压缩到 4000 万像素以内')
@@ -54,48 +102,196 @@ export function defaultCorners(): Point[] {
 
 function createScaledCanvas(bitmap: ImageBitmap) {
   const scale = Math.min(1, MAX_PROCESS_EDGE / Math.max(bitmap.width, bitmap.height))
-  const canvas = document.createElement('canvas')
-  canvas.width = Math.max(1, Math.round(bitmap.width * scale))
-  canvas.height = Math.max(1, Math.round(bitmap.height * scale))
-  const context = canvas.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('浏览器无法创建图像画布')
+  const canvas = createCanvas(
+    Math.max(1, Math.round(bitmap.width * scale)),
+    Math.max(1, Math.round(bitmap.height * scale)),
+  )
+  const context = context2d(canvas, true)
   context.fillStyle = '#fff'
   context.fillRect(0, 0, canvas.width, canvas.height)
   context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
   return canvas
 }
 
-export function detectPaperCorners(image: ImageData): Point[] {
-  const { width, height, data } = image
-  const step = Math.max(1, Math.floor(Math.max(width, height) / 360))
-  const candidates: Point[] = []
+function luminanceAt(data: Uint8ClampedArray, index: number) {
+  return 0.299 * data[index] + 0.587 * data[index + 1] + 0.114 * data[index + 2]
+}
 
-  for (let y = 0; y < height; y += step) {
-    for (let x = 0; x < width; x += step) {
-      const index = (y * width + x) * 4
-      const r = data[index]
-      const g = data[index + 1]
-      const b = data[index + 2]
-      const max = Math.max(r, g, b)
-      const min = Math.min(r, g, b)
-      const luminance = 0.299 * r + 0.587 * g + 0.114 * b
-      if (luminance > 150 && max - min < 58) candidates.push({ x, y })
+function percentile(values: number[], ratio: number) {
+  if (values.length === 0) return 0
+  values.sort((a, b) => a - b)
+  return values[Math.min(values.length - 1, Math.floor(values.length * ratio))]
+}
+
+interface FittedLine {
+  slope: number
+  intercept: number
+  residual: number
+  support: number
+}
+
+interface EdgeScan {
+  position: number
+  candidates: Array<{ coordinate: number; strength: number }>
+}
+
+function houghLine(scans: EdgeScan[], side: 'min' | 'max'): FittedLine | undefined {
+  if (scans.length < 4) return undefined
+  const binSize = 0.004
+  const minimumIntercept = -0.1
+  const binCount = 300
+  let best: FittedLine | undefined
+  let bestScore = -Infinity
+  for (let slopeIndex = 0; slopeIndex <= 80; slopeIndex += 1) {
+    const slope = -0.08 + slopeIndex * 0.002
+    const strengths = new Float32Array(binCount)
+    const support = new Uint16Array(binCount)
+    const rowStrength = new Float32Array(binCount)
+    for (const scan of scans) {
+      const touched: number[] = []
+      for (const candidate of scan.candidates) {
+        const intercept = candidate.coordinate - slope * scan.position
+        const bin = Math.round((intercept - minimumIntercept) / binSize)
+        if (bin < 0 || bin >= binCount) continue
+        if (rowStrength[bin] === 0) touched.push(bin)
+        rowStrength[bin] = Math.max(rowStrength[bin], Math.min(40, candidate.strength))
+      }
+      for (const bin of touched) {
+        strengths[bin] += rowStrength[bin]
+        support[bin] += 1
+        rowStrength[bin] = 0
+      }
+    }
+    for (let bin = 0; bin < binCount; bin += 1) {
+      const score = support[bin] + strengths[bin] / 200 - Math.abs(slope) * 200
+      if (score <= bestScore) continue
+      bestScore = score
+      best = {
+        slope,
+        intercept: minimumIntercept + bin * binSize,
+        residual: Math.max(0.004, 1 - support[bin] / scans.length) * 0.02,
+        support: support[bin] / scans.length,
+      }
     }
   }
+  if (!best || best.support >= 0.14) return best
+  return { slope: 0, intercept: side === 'min' ? 0 : 1, residual: 0.025, support: best.support }
+}
 
-  if (candidates.length < (width * height) / (step * step) * 0.12) return defaultCorners()
+function intersect(vertical: FittedLine | undefined, horizontal: FittedLine | undefined) {
+  if (!vertical || !horizontal) return undefined
+  const denominator = 1 - vertical.slope * horizontal.slope
+  if (Math.abs(denominator) < 1e-6) return undefined
+  const y = (horizontal.slope * vertical.intercept + horizontal.intercept) / denominator
+  return { x: vertical.slope * y + vertical.intercept, y }
+}
 
-  const topLeft = candidates.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b))
-  const bottomRight = candidates.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b))
-  const topRight = candidates.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b))
-  const bottomLeft = candidates.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b))
+export function detectPaperBoundary(image: ImageData): BoundaryDetection {
+  const { width, height, data } = image
+  const scale = Math.max(width, height)
+  const step = Math.max(2, Math.floor(scale / 240))
+  const gridWidth = Math.ceil(width / step)
+  const gridHeight = Math.ceil(height / step)
+  const luminance = new Float32Array(gridWidth * gridHeight)
+  for (let row = 0; row < gridHeight; row += 1) {
+    for (let column = 0; column < gridWidth; column += 1) {
+      const x = Math.min(width - 1, column * step)
+      const y = Math.min(height - 1, row * step)
+      luminance[row * gridWidth + column] = luminanceAt(data, (y * width + x) * 4)
+    }
+  }
+  const smoothed = new Float32Array(luminance.length)
+  for (let row = 1; row < gridHeight - 1; row += 1) {
+    for (let column = 1; column < gridWidth - 1; column += 1) {
+      let sum = 0
+      for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+          sum += luminance[(row + offsetY) * gridWidth + column + offsetX]
+        }
+      }
+      smoothed[row * gridWidth + column] = sum / 9
+    }
+  }
+  const left: EdgeScan[] = []
+  const right: EdgeScan[] = []
+  for (let row = 2; row < gridHeight - 2; row += 1) {
+    const leftScan: EdgeScan = { position: row / gridHeight, candidates: [] }
+    const rightScan: EdgeScan = { position: row / gridHeight, candidates: [] }
+    for (let column = 2; column < gridWidth - 2; column += 1) {
+      const gradient = (smoothed[row * gridWidth + column + 1] - smoothed[row * gridWidth + column - 1]) / 2
+      const coordinate = column / gridWidth
+      if (coordinate >= 0.015 && coordinate < 0.4 && gradient > 4) {
+        leftScan.candidates.push({ coordinate, strength: gradient })
+      }
+      if (coordinate > 0.6 && coordinate <= 0.985 && gradient < -4) {
+        rightScan.candidates.push({ coordinate, strength: -gradient })
+      }
+    }
+    left.push(leftScan)
+    right.push(rightScan)
+  }
+  const top: EdgeScan[] = []
+  const bottom: EdgeScan[] = []
+  for (let column = 2; column < gridWidth - 2; column += 1) {
+    const topScan: EdgeScan = { position: column / gridWidth, candidates: [] }
+    const bottomScan: EdgeScan = { position: column / gridWidth, candidates: [] }
+    for (let row = 2; row < gridHeight - 2; row += 1) {
+      const gradient = (smoothed[(row + 1) * gridWidth + column] - smoothed[(row - 1) * gridWidth + column]) / 2
+      const coordinate = row / gridHeight
+      if (coordinate >= 0.015 && coordinate < 0.35 && gradient > 4) {
+        topScan.candidates.push({ coordinate, strength: gradient })
+      }
+      if (coordinate > 0.65 && coordinate <= 0.985 && gradient < -4) {
+        bottomScan.candidates.push({ coordinate, strength: -gradient })
+      }
+    }
+    top.push(topScan)
+    bottom.push(bottomScan)
+  }
 
-  const normalized = [topLeft, topRight, bottomRight, bottomLeft].map(({ x, y }) => ({
-    x: Math.min(1, Math.max(0, x / width)),
-    y: Math.min(1, Math.max(0, y / height)),
+  const leftLine = houghLine(left, 'min')
+  const rightLine = houghLine(right, 'max')
+  const topLine = houghLine(top, 'min')
+  const bottomLine = houghLine(bottom, 'max')
+  const intersections = [
+    intersect(leftLine, topLine),
+    intersect(rightLine, topLine),
+    intersect(rightLine, bottomLine),
+    intersect(leftLine, bottomLine),
+  ]
+  if (intersections.some((point) => !point)) {
+    return { corners: defaultCorners(), confidence: 0, accepted: false }
+  }
+  const corners = intersections.map((point) => ({
+    x: Math.min(1, Math.max(0, point?.x ?? 0)),
+    y: Math.min(1, Math.max(0, point?.y ?? 0)),
   }))
-  const area = polygonArea(normalized)
-  return area > 0.3 ? normalized : defaultCorners()
+  const area = polygonArea(corners)
+  const support = [leftLine, rightLine, topLine, bottomLine]
+    .filter((line): line is FittedLine => Boolean(line))
+    .reduce((sum, line) => sum + line.support, 0) / 4
+  const residual = [leftLine, rightLine, topLine, bottomLine]
+    .filter((line): line is NonNullable<typeof line> => Boolean(line))
+    .reduce((sum, line) => sum + line.residual, 0) / 4
+  const geometry = area >= 0.42 && area <= 1.02 ? 1 : Math.max(0, 1 - Math.abs(area - 0.72) * 3)
+  const rawConfidence = Math.max(0, Math.min(1, support * 0.45 + geometry * 0.4 + Math.max(0, 1 - residual * 18) * 0.15))
+  const meanTop = (corners[0].y + corners[1].y) / 2
+  const meanRight = (corners[1].x + corners[2].x) / 2
+  const meanBottom = (corners[2].y + corners[3].y) / 2
+  const meanLeft = (corners[0].x + corners[3].x) / 2
+  const coversPlausiblePage = meanTop <= 0.28 && meanRight >= 0.7 && meanBottom >= 0.76 && meanLeft <= 0.34
+  const confidence = coversPlausiblePage
+    ? rawConfidence
+    : Math.min(rawConfidence, BOUNDARY_ACCEPTANCE - 0.01)
+  return {
+    corners: confidence >= BOUNDARY_ACCEPTANCE ? corners : defaultCorners(),
+    confidence,
+    accepted: confidence >= BOUNDARY_ACCEPTANCE,
+  }
+}
+
+export function detectPaperCorners(image: ImageData): Point[] {
+  return detectPaperBoundary(image).corners
 }
 
 export function polygonArea(points: Point[]) {
@@ -126,9 +322,7 @@ function solveLinear(matrix: number[][], values: number[]) {
     for (let row = 0; row < size; row += 1) {
       if (row === column) continue
       const factor = augmented[row][column]
-      for (let item = column; item <= size; item += 1) {
-        augmented[row][item] -= factor * augmented[column][item]
-      }
+      for (let item = column; item <= size; item += 1) augmented[row][item] -= factor * augmented[column][item]
     }
   }
   return augmented.map((row) => row[size])
@@ -155,40 +349,41 @@ export function projectPoint(point: Point, coefficients: number[]): Point {
   }
 }
 
-function warpPerspective(source: HTMLCanvasElement, normalizedCorners: Point[]) {
-  const corners = normalizedCorners.map((point) => ({
-    x: point.x * source.width,
-    y: point.y * source.height,
-  }))
+function warpPerspective(source: CanvasLike, normalizedCorners: Point[]) {
+  const corners = normalizedCorners.map((point) => ({ x: point.x * source.width, y: point.y * source.height }))
   const width = Math.max(distance(corners[0], corners[1]), distance(corners[3], corners[2]))
   const height = Math.max(distance(corners[0], corners[3]), distance(corners[1], corners[2]))
-  const output = document.createElement('canvas')
-  output.width = Math.max(2, Math.min(MAX_PROCESS_EDGE, Math.round(width)))
-  output.height = Math.max(2, Math.round((output.width * height) / Math.max(1, width)))
-
-  const sourceContext = source.getContext('2d', { willReadFrequently: true })
-  const outputContext = output.getContext('2d')
-  if (!sourceContext || !outputContext) throw new Error('无法读取图像画布')
-  const input = sourceContext.getImageData(0, 0, source.width, source.height)
+  const outputWidth = Math.max(2, Math.min(MAX_PROCESS_EDGE, Math.round(width)))
+  const output = createCanvas(outputWidth, Math.max(2, Math.round((outputWidth * height) / Math.max(1, width))))
+  const input = context2d(source, true).getImageData(0, 0, source.width, source.height)
+  const outputContext = context2d(output)
   const result = outputContext.createImageData(output.width, output.height)
   const destination = [
-    { x: 0, y: 0 },
-    { x: output.width - 1, y: 0 },
-    { x: output.width - 1, y: output.height - 1 },
-    { x: 0, y: output.height - 1 },
+    { x: 0, y: 0 }, { x: output.width - 1, y: 0 },
+    { x: output.width - 1, y: output.height - 1 }, { x: 0, y: output.height - 1 },
   ]
   const coefficients = perspectiveCoefficients(destination, corners)
-
   for (let y = 0; y < output.height; y += 1) {
     for (let x = 0; x < output.width; x += 1) {
       const mapped = projectPoint({ x, y }, coefficients)
-      const sourceX = Math.min(source.width - 1, Math.max(0, Math.round(mapped.x)))
-      const sourceY = Math.min(source.height - 1, Math.max(0, Math.round(mapped.y)))
-      const sourceIndex = (sourceY * source.width + sourceX) * 4
       const targetIndex = (y * output.width + x) * 4
-      result.data[targetIndex] = input.data[sourceIndex]
-      result.data[targetIndex + 1] = input.data[sourceIndex + 1]
-      result.data[targetIndex + 2] = input.data[sourceIndex + 2]
+      const sourceX = Math.min(source.width - 1, Math.max(0, mapped.x))
+      const sourceY = Math.min(source.height - 1, Math.max(0, mapped.y))
+      const left = Math.floor(sourceX)
+      const top = Math.floor(sourceY)
+      const right = Math.min(source.width - 1, left + 1)
+      const bottom = Math.min(source.height - 1, top + 1)
+      const weightX = sourceX - left
+      const weightY = sourceY - top
+      const topLeft = (top * source.width + left) * 4
+      const topRight = (top * source.width + right) * 4
+      const bottomLeft = (bottom * source.width + left) * 4
+      const bottomRight = (bottom * source.width + right) * 4
+      for (let channel = 0; channel < 3; channel += 1) {
+        const topValue = input.data[topLeft + channel] * (1 - weightX) + input.data[topRight + channel] * weightX
+        const bottomValue = input.data[bottomLeft + channel] * (1 - weightX) + input.data[bottomRight + channel] * weightX
+        result.data[targetIndex + channel] = Math.round(topValue * (1 - weightY) + bottomValue * weightY)
+      }
       result.data[targetIndex + 3] = 255
     }
   }
@@ -196,159 +391,114 @@ function warpPerspective(source: HTMLCanvasElement, normalizedCorners: Point[]) 
   return output
 }
 
-function rotateCanvas(source: HTMLCanvasElement, degrees: number) {
+function rotateCanvas(source: CanvasLike, degrees: Rotation) {
   if (degrees === 0) return source
-  const output = document.createElement('canvas')
   const swap = degrees === 90 || degrees === 270
-  output.width = swap ? source.height : source.width
-  output.height = swap ? source.width : source.height
-  const context = output.getContext('2d')
-  if (!context) throw new Error('无法旋转图像')
+  const output = createCanvas(swap ? source.height : source.width, swap ? source.width : source.height)
+  const context = context2d(output)
   context.translate(output.width / 2, output.height / 2)
   context.rotate((degrees * Math.PI) / 180)
   context.drawImage(source, -source.width / 2, -source.height / 2)
   return output
 }
 
-function enhance(source: HTMLCanvasElement, mode: ColorMode) {
-  const output = document.createElement('canvas')
-  output.width = source.width
-  output.height = source.height
-  const context = output.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('无法增强图像')
+function enhance(source: CanvasLike) {
+  const output = createCanvas(source.width, source.height)
+  const context = context2d(output, true)
   context.drawImage(source, 0, 0)
   const image = context.getImageData(0, 0, output.width, output.height)
-  const { data } = image
-  for (let index = 0; index < data.length; index += 4) {
-    const r = data[index]
-    const g = data[index + 1]
-    const b = data[index + 2]
-    const luminance = 0.299 * r + 0.587 * g + 0.114 * b
-    const contrast = luminance < 165 ? 0.72 : 1 + (255 - luminance) * 0.018
-    const target = Math.max(0, Math.min(255, luminance * contrast))
-    if (mode === 'mono') {
-      data[index] = target
-      data[index + 1] = target
-      data[index + 2] = target
-    } else {
-      const ratio = luminance > 0 ? target / luminance : 1
-      data[index] = Math.min(255, r * ratio)
-      data[index + 1] = Math.min(255, g * ratio)
-      data[index + 2] = Math.min(255, b * ratio)
+  const tileSize = 48
+  const columns = Math.ceil(output.width / tileSize)
+  const rows = Math.ceil(output.height / tileSize)
+  const background = new Float32Array(columns * rows)
+  for (let tileY = 0; tileY < rows; tileY += 1) {
+    for (let tileX = 0; tileX < columns; tileX += 1) {
+      const values: number[] = []
+      for (let y = tileY * tileSize; y < Math.min(output.height, (tileY + 1) * tileSize); y += 4) {
+        for (let x = tileX * tileSize; x < Math.min(output.width, (tileX + 1) * tileSize); x += 4) {
+          values.push(luminanceAt(image.data, (y * output.width + x) * 4))
+        }
+      }
+      background[tileY * columns + tileX] = percentile(values, 0.82) || 235
+    }
+  }
+  for (let y = 0; y < output.height; y += 1) {
+    for (let x = 0; x < output.width; x += 1) {
+      const index = (y * output.width + x) * 4
+      const luminance = luminanceAt(image.data, index)
+      const tileX = Math.min(columns - 1, Math.floor(x / tileSize))
+      const tileY = Math.min(rows - 1, Math.floor(y / tileSize))
+      const nextX = Math.min(columns - 1, tileX + 1)
+      const nextY = Math.min(rows - 1, tileY + 1)
+      const blendX = (x % tileSize) / tileSize
+      const blendY = (y % tileSize) / tileSize
+      const topPaper = background[tileY * columns + tileX] * (1 - blendX) + background[tileY * columns + nextX] * blendX
+      const bottomPaper = background[nextY * columns + tileX] * (1 - blendX) + background[nextY * columns + nextX] * blendX
+      const paper = topPaper * (1 - blendY) + bottomPaper * blendY
+      const normalized = Math.max(0, Math.min(255, luminance + (246 - paper) * 0.82))
+      const target = Math.max(0, Math.min(255, normalized < 205 ? 205 + (normalized - 205) * 1.08 : normalized))
+      image.data[index] = target
+      image.data[index + 1] = target
+      image.data[index + 2] = target
     }
   }
   context.putImageData(image, 0, 0)
   return output
 }
 
-function smartErase(source: HTMLCanvasElement) {
-  const output = document.createElement('canvas')
-  output.width = source.width
-  output.height = source.height
-  const context = output.getContext('2d', { willReadFrequently: true })
-  if (!context) throw new Error('无法执行智能擦除')
-  context.drawImage(source, 0, 0)
-  const image = context.getImageData(0, 0, output.width, output.height)
-  const { data, width, height } = image
-  const rowDensity = new Float32Array(height)
-
-  for (let y = 0; y < height; y += 1) {
-    let dark = 0
-    for (let x = 0; x < width; x += 2) {
-      const index = (y * width + x) * 4
-      const luminance = 0.299 * data[index] + 0.587 * data[index + 1] + 0.114 * data[index + 2]
-      if (luminance < 125) dark += 1
-    }
-    rowDensity[y] = dark / Math.ceil(width / 2)
-  }
-
-  const reviewRegions: ReviewRegion[] = []
-  const gridColumns = 4
-  const gridRows = 6
-  const uncertainGrid = new Uint32Array(gridColumns * gridRows)
-
-  for (let y = 1; y < height - 1; y += 1) {
-    const inPrintedBand =
-      rowDensity[Math.max(0, y - 2)] > 0.045 ||
-      rowDensity[y] > 0.045 ||
-      rowDensity[Math.min(height - 1, y + 2)] > 0.045
-    for (let x = 1; x < width - 1; x += 1) {
-      const index = (y * width + x) * 4
-      const r = data[index]
-      const g = data[index + 1]
-      const b = data[index + 2]
-      const max = Math.max(r, g, b)
-      const min = Math.min(r, g, b)
-      const chroma = max - min
-      const luminance = 0.299 * r + 0.587 * g + 0.114 * b
-      const coloredInk = chroma > 48 && luminance < 210 && (b > r * 1.12 || r > g * 1.25)
-      const localVertical =
-        Math.abs(data[index - width * 4] - r) + Math.abs(data[index + width * 4] - r)
-      const blackHandwritingCandidate =
-        luminance < 82 && !inPrintedBand && localVertical > 18 && y > height * 0.04
-      const faintWatermark = luminance > 178 && luminance < 232 && chroma < 18
-
-      if (coloredInk || blackHandwritingCandidate || faintWatermark) {
-        const strength = coloredInk ? 1 : blackHandwritingCandidate ? 0.92 : 0.55
-        const paper = 255 - (1 - strength) * (255 - luminance)
-        data[index] = paper
-        data[index + 1] = paper
-        data[index + 2] = paper
-      } else if (luminance < 100 && inPrintedBand && localVertical > 55) {
-        const column = Math.min(gridColumns - 1, Math.floor((x / width) * gridColumns))
-        const row = Math.min(gridRows - 1, Math.floor((y / height) * gridRows))
-        uncertainGrid[row * gridColumns + column] += 1
-      }
-    }
-  }
-
-  const cellThreshold = (width * height) / (gridColumns * gridRows) * 0.004
-  uncertainGrid.forEach((count, index) => {
-    if (count < cellThreshold || reviewRegions.length >= 6) return
-    reviewRegions.push({
-      x: (index % gridColumns) / gridColumns,
-      y: Math.floor(index / gridColumns) / gridRows,
-      width: 1 / gridColumns,
-      height: 1 / gridRows,
-      reason: '检测到与印刷文字相邻的黑色笔迹，请复核',
-    })
-  })
-  context.putImageData(image, 0, 0)
-  return { canvas: output, reviewRegions }
-}
-
 export async function processWorksheet(blob: Blob, options: ProcessOptions = {}): Promise<ProcessResult> {
   const report = options.onProgress ?? (() => undefined)
   assertActive(options.signal)
-  report(8)
+  report(5, 'decoding')
   const bitmap = await decodeBlob(blob)
   try {
     const source = createScaledCanvas(bitmap)
-    report(20)
+    const sourcePreview = await canvasToBlob(source, 0.9)
+    const sourceImage = context2d(source, true).getImageData(0, 0, source.width, source.height)
+    report(16, 'orientation')
+    const orientation = await predictOrientation(sourceImage)
     assertActive(options.signal)
-    const sourceContext = source.getContext('2d', { willReadFrequently: true })
-    if (!sourceContext) throw new Error('无法读取图片')
-    const detected = options.corners ?? detectPaperCorners(
-      sourceContext.getImageData(0, 0, source.width, source.height),
-    )
-    const warped = warpPerspective(source, detected)
-    const rotated = rotateCanvas(warped, options.rotation ?? 0)
-    report(48)
+    const autoRotation = orientation.confidence >= ORIENTATION_ACCEPTANCE ? orientation.rotation : 0
+    const boundary = options.corners
+      ? { corners: options.corners, confidence: 1, accepted: true }
+      : detectPaperBoundary(sourceImage)
+    report(34, 'boundary')
+    const warped = warpPerspective(source, boundary.corners)
+    const effectiveRotation = ((autoRotation + (options.rotation ?? 0)) % 360) as Rotation
+    const rotated = rotateCanvas(warped, effectiveRotation)
     assertActive(options.signal)
-    const enhancedCanvas = enhance(rotated, options.colorMode ?? 'color')
+    report(56, 'enhancement')
+    const enhancedCanvas = enhance(rotated)
     const enhanced = await canvasToBlob(enhancedCanvas)
-    report(68)
     assertActive(options.signal)
-    const erased = smartErase(enhancedCanvas)
-    const processed = await canvasToBlob(erased.canvas)
-    report(100)
+    report(94, 'compositing')
+    const processed = enhanced
+    const warnings = [
+      !boundary.accepted ? '未可靠检测到纸张边界，已保留完整画面，请调整四角' : undefined,
+      orientation.confidence < ORIENTATION_ACCEPTANCE
+        ? '未能可靠判断页面方向，请确认是否需要旋转'
+        : undefined,
+    ].filter(Boolean)
+    report(100, 'compositing')
     return {
+      sourcePreview,
+      sourceWidth: bitmap.width,
+      sourceHeight: bitmap.height,
       enhanced,
       processed,
-      width: erased.canvas.width,
-      height: erased.canvas.height,
-      corners: detected,
-      reviewRegions: erased.reviewRegions,
+      width: enhancedCanvas.width,
+      height: enhancedCanvas.height,
+      corners: boundary.corners,
+      diagnostics: {
+        autoRotation,
+        effectiveRotation,
+        orientationConfidence: orientation.confidence,
+        boundaryConfidence: boundary.confidence,
+        boundaryAccepted: boundary.accepted,
+        orientationBackend: orientation.backend,
+        orientationModelVersion: orientation.modelVersion,
+        warning: warnings.join('；') || undefined,
+      },
     }
   } finally {
     bitmap.close()
@@ -371,10 +521,7 @@ function drawStroke(context: CanvasRenderingContext2D, stroke: Stroke, source?: 
   context.lineJoin = 'round'
   context.lineWidth = stroke.size
   context.beginPath()
-  stroke.points.forEach((point, index) => {
-    if (index === 0) context.moveTo(point.x, point.y)
-    else context.lineTo(point.x, point.y)
-  })
+  stroke.points.forEach((point, index) => index === 0 ? context.moveTo(point.x, point.y) : context.lineTo(point.x, point.y))
   if (stroke.points.length === 1) {
     const point = stroke.points[0]
     context.arc(point.x, point.y, stroke.size / 2, 0, Math.PI * 2)
@@ -391,11 +538,7 @@ function drawStroke(context: CanvasRenderingContext2D, stroke: Stroke, source?: 
   context.restore()
 }
 
-export async function renderEditedPage(
-  processedUrl: string,
-  enhancedUrl: string,
-  strokes: Stroke[],
-) {
+export async function renderEditedPage(processedUrl: string, enhancedUrl: string, strokes: Stroke[]) {
   const [processed, enhanced] = await Promise.all([loadImage(processedUrl), loadImage(enhancedUrl)])
   const canvas = document.createElement('canvas')
   canvas.width = processed.naturalWidth

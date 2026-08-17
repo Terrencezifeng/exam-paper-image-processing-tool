@@ -26,7 +26,7 @@ export function sanitizePdfFilename(filename: string) {
     .replace(/[<>:"/\\|?*]/g, '_')
     .replace(/[. ]+$/g, '')
     .slice(0, 80)
-  const base = cleaned.replace(/\.pdf$/i, '') || '净化试卷'
+  const base = cleaned.replace(/\.pdf$/i, '') || '整理后的试卷'
   return `${base}.pdf`
 }
 
@@ -52,7 +52,8 @@ export async function exportPdf(
     output.height = Math.max(1, Math.round(source.height * quality.scale))
     const context = output.getContext('2d')
     if (!context) throw new Error('无法准备 PDF 页面')
-    if (settings.colorMode === 'mono') context.filter = 'grayscale(1)'
+    context.imageSmoothingEnabled = true
+    context.imageSmoothingQuality = 'high'
     context.drawImage(source, 0, 0, output.width, output.height)
     const ratio = Math.min(availableWidth / output.width, availableHeight / output.height)
     const width = output.width * ratio
@@ -62,5 +63,5 @@ export async function exportPdf(
     pdf.addImage(output.toDataURL('image/jpeg', quality.jpeg), 'JPEG', x, y, width, height, undefined, 'FAST')
     onProgress?.(Math.round(((index + 1) / pages.length) * 100))
   }
-  download(pdf.output('blob'), settings.filename.trim() || '净化试卷')
+  download(pdf.output('blob'), settings.filename.trim() || '整理后的试卷')
 }
