@@ -10,6 +10,8 @@ export type PageStatus =
 export type EditTool = 'eraser' | 'restore'
 export type EditorTool = 'pan' | EditTool
 export type Rotation = 0 | 90 | 180 | 270
+export type EnhancementPreset = 'soft' | 'clear' | 'highContrast'
+export type ReviewReason = 'orientation' | 'boundary'
 export type InferenceBackend = 'webgpu' | 'wasm' | 'unavailable'
 export type ProcessingStage =
   | 'queued'
@@ -30,6 +32,8 @@ export type ProcessingDiagnostics = {
   autoRotation: Rotation
   effectiveRotation: Rotation
   orientationConfidence: number
+  orientationMargin: number
+  orientationAccepted: boolean
   boundaryConfidence: number
   boundaryAccepted: boolean
   orientationBackend: InferenceBackend
@@ -52,6 +56,9 @@ export type WorksheetPage = {
   progress: number
   rotation: Rotation
   autoRotation: Rotation
+  enhancementPreset: EnhancementPreset
+  reviewReasons: ReviewReason[]
+  reviewConfirmed: boolean
   corners: Point[]
   processingStage: ProcessingStage
   enhanced?: Blob
@@ -91,7 +98,8 @@ export type PersistedPage = Omit<
 
 export type PersistedTask = {
   id: string
-  version: 3
+  version: 4
   updatedAt: number
+  defaultEnhancementPreset: EnhancementPreset
   pages: PersistedPage[]
 }

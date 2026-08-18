@@ -8,6 +8,7 @@ const heicMocks = vi.hoisted(() => ({
 vi.mock('heic-to/csp', () => heicMocks)
 
 import {
+  applyEnhancementPreset,
   decodeBlob,
   defaultCorners,
   detectPaperBoundary,
@@ -94,5 +95,63 @@ describe('conservative page detection', () => {
     const result = detectPaperBoundary(image)
     expect(result.accepted).toBe(false)
     expect(result.corners).toEqual(defaultCorners())
+  })
+})
+
+describe('text enhancement presets', () => {
+  function fixture() {
+    const width = 96
+    const height = 64
+    const data = new Uint8ClampedArray(width * height * 4)
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = (y * width + x) * 4
+        const background = 242 + Math.round((x / (width - 1)) * 6)
+        const isText = (x >= 18 && x <= 20 && y >= 10 && y <= 53) ||
+          (x >= 38 && x <= 76 && y >= 28 && y <= 30)
+        const value = isText ? 165 : background
+        data[index] = value
+        data[index + 1] = value
+        data[index + 2] = value
+        data[index + 3] = 255
+      }
+    }
+    return { width, height, data } as ImageData
+  }
+
+  function metrics(image: ImageData) {
+    const background: number[] = []
+    const ink: number[] = []
+    for (let y = 0; y < image.height; y += 1) {
+      for (let x = 0; x < image.width; x += 1) {
+        const value = image.data[(y * image.width + x) * 4]
+        const isText = (x >= 18 && x <= 20 && y >= 10 && y <= 53) ||
+          (x >= 38 && x <= 76 && y >= 28 && y <= 30)
+        ;(isText ? ink : background).push(value)
+      }
+    }
+    const mean = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+    const backgroundMean = mean(background)
+    const variance = mean(background.map((value) => (value - backgroundMean) ** 2))
+    return {
+      contrast: backgroundMean - mean(ink),
+      backgroundDeviation: Math.sqrt(variance),
+      retainedInk: ink.filter((value) => value < 210).length / ink.length,
+    }
+  }
+
+  it('increases local text contrast without losing thin lines or worsening the bright background', () => {
+    const soft = fixture()
+    const clear = applyEnhancementPreset(fixture(), 'clear')
+    const high = applyEnhancementPreset(fixture(), 'highContrast')
+    const softMetrics = metrics(soft)
+    const clearMetrics = metrics(clear)
+    const highMetrics = metrics(high)
+    expect(clearMetrics.contrast / softMetrics.contrast).toBeGreaterThanOrEqual(1.1)
+    expect(highMetrics.contrast / softMetrics.contrast).toBeGreaterThanOrEqual(1.2)
+    expect(clearMetrics.backgroundDeviation).toBeLessThanOrEqual(softMetrics.backgroundDeviation)
+    expect(highMetrics.backgroundDeviation).toBeLessThanOrEqual(softMetrics.backgroundDeviation)
+    expect(clearMetrics.retainedInk).toBeGreaterThanOrEqual(0.995)
+    expect(highMetrics.retainedInk).toBeGreaterThanOrEqual(0.995)
   })
 })

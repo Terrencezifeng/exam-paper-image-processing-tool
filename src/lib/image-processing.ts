@@ -1,6 +1,8 @@
 import { MAX_PIXELS } from './files'
 import { predictOrientation } from './model-runtime'
 import type {
+  EnhancementPreset,
+  InferenceBackend,
   Point,
   ProcessingDiagnostics,
   ProcessingStage,
@@ -9,7 +11,6 @@ import type {
 } from '../types'
 
 const MAX_PROCESS_EDGE = 2400
-const ORIENTATION_ACCEPTANCE = 0.82
 const BOUNDARY_ACCEPTANCE = 0.72
 
 type CanvasLike = HTMLCanvasElement | OffscreenCanvas
@@ -30,6 +31,20 @@ export type ProcessResult = {
 export type ProcessOptions = {
   corners?: Point[]
   rotation?: Rotation
+  enhancementPreset?: EnhancementPreset
+  lockedGeometry?: {
+    corners: Point[]
+    autoRotation: Rotation
+    effectiveRotation: Rotation
+    orientationConfidence: number
+    orientationMargin: number
+    orientationAccepted: boolean
+    boundaryConfidence: number
+    boundaryAccepted: boolean
+    orientationBackend: InferenceBackend
+    orientationModelVersion?: string
+    warning?: string
+  }
   signal?: AbortSignal
   onProgress?: (progress: number, stage: ProcessingStage) => void
 }
@@ -402,7 +417,48 @@ function rotateCanvas(source: CanvasLike, degrees: Rotation) {
   return output
 }
 
-function enhance(source: CanvasLike) {
+export function applyEnhancementPreset(image: ImageData, preset: EnhancementPreset) {
+  if (preset === 'soft') return image
+  const contrast = preset === 'clear' ? 1.18 : 1.35
+  const amount = preset === 'clear' ? 0.55 : 0.8
+  const pixels = image.width * image.height
+  const contrasted = new Uint8ClampedArray(pixels)
+  for (let pixel = 0; pixel < pixels; pixel += 1) {
+    contrasted[pixel] = Math.max(0, Math.min(255, 220 + (image.data[pixel * 4] - 220) * contrast))
+  }
+  const horizontal = new Uint8ClampedArray(pixels)
+  const blurred = new Uint8ClampedArray(pixels)
+  for (let y = 0; y < image.height; y += 1) {
+    for (let x = 0; x < image.width; x += 1) {
+      const left = y * image.width + Math.max(0, x - 1)
+      const center = y * image.width + x
+      const right = y * image.width + Math.min(image.width - 1, x + 1)
+      horizontal[center] = (contrasted[left] + 2 * contrasted[center] + contrasted[right]) / 4
+    }
+  }
+  for (let y = 0; y < image.height; y += 1) {
+    for (let x = 0; x < image.width; x += 1) {
+      const top = Math.max(0, y - 1) * image.width + x
+      const center = y * image.width + x
+      const bottom = Math.min(image.height - 1, y + 1) * image.width + x
+      blurred[center] = (horizontal[top] + 2 * horizontal[center] + horizontal[bottom]) / 4
+    }
+  }
+  for (let pixel = 0; pixel < pixels; pixel += 1) {
+    const index = pixel * 4
+    const original = image.data[index]
+    const sharpened = contrasted[pixel] + amount * (contrasted[pixel] - blurred[pixel])
+    const target = original >= 235
+      ? Math.max(0, Math.min(255, 246 + (original - 246) * 0.5))
+      : Math.max(0, Math.min(255, sharpened))
+    image.data[index] = target
+    image.data[index + 1] = target
+    image.data[index + 2] = target
+  }
+  return image
+}
+
+function enhance(source: CanvasLike, preset: EnhancementPreset) {
   const output = createCanvas(source.width, source.height)
   const context = context2d(output, true)
   context.drawImage(source, 0, 0)
@@ -442,6 +498,7 @@ function enhance(source: CanvasLike) {
       image.data[index + 2] = target
     }
   }
+  applyEnhancementPreset(image, preset)
   context.putImageData(image, 0, 0)
   return output
 }
@@ -456,26 +513,42 @@ export async function processWorksheet(blob: Blob, options: ProcessOptions = {})
     const sourcePreview = await canvasToBlob(source, 0.9)
     const sourceImage = context2d(source, true).getImageData(0, 0, source.width, source.height)
     report(16, 'orientation')
-    const orientation = await predictOrientation(sourceImage)
+    const orientation = options.lockedGeometry
+      ? {
+          rotation: options.lockedGeometry.autoRotation,
+          confidence: options.lockedGeometry.orientationConfidence,
+          confidenceMargin: options.lockedGeometry.orientationMargin,
+          accepted: options.lockedGeometry.orientationAccepted,
+          backend: options.lockedGeometry.orientationBackend,
+          modelVersion: options.lockedGeometry.orientationModelVersion,
+        }
+      : await predictOrientation(sourceImage)
     assertActive(options.signal)
-    const autoRotation = orientation.confidence >= ORIENTATION_ACCEPTANCE ? orientation.rotation : 0
-    const boundary = options.corners
+    const autoRotation = options.lockedGeometry?.autoRotation ?? (orientation.accepted ? orientation.rotation : 0)
+    const boundary = options.lockedGeometry
+      ? {
+          corners: options.lockedGeometry.corners,
+          confidence: options.lockedGeometry.boundaryConfidence,
+          accepted: options.lockedGeometry.boundaryAccepted,
+        }
+      : options.corners
       ? { corners: options.corners, confidence: 1, accepted: true }
       : detectPaperBoundary(sourceImage)
     report(34, 'boundary')
     const warped = warpPerspective(source, boundary.corners)
-    const effectiveRotation = ((autoRotation + (options.rotation ?? 0)) % 360) as Rotation
+    const effectiveRotation = options.lockedGeometry?.effectiveRotation ??
+      ((autoRotation + (options.rotation ?? 0)) % 360) as Rotation
     const rotated = rotateCanvas(warped, effectiveRotation)
     assertActive(options.signal)
     report(56, 'enhancement')
-    const enhancedCanvas = enhance(rotated)
+    const enhancedCanvas = enhance(rotated, options.enhancementPreset ?? 'clear')
     const enhanced = await canvasToBlob(enhancedCanvas)
     assertActive(options.signal)
     report(94, 'compositing')
     const processed = enhanced
-    const warnings = [
+    const warnings = options.lockedGeometry?.warning ? [options.lockedGeometry.warning] : [
       !boundary.accepted ? '未可靠检测到纸张边界，已保留完整画面，请调整四角' : undefined,
-      orientation.confidence < ORIENTATION_ACCEPTANCE
+      !orientation.accepted
         ? '未能可靠判断页面方向，请确认是否需要旋转'
         : undefined,
     ].filter(Boolean)
@@ -493,6 +566,8 @@ export async function processWorksheet(blob: Blob, options: ProcessOptions = {})
         autoRotation,
         effectiveRotation,
         orientationConfidence: orientation.confidence,
+        orientationMargin: orientation.confidenceMargin,
+        orientationAccepted: orientation.accepted,
         boundaryConfidence: boundary.confidence,
         boundaryAccepted: boundary.accepted,
         orientationBackend: orientation.backend,

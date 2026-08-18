@@ -281,14 +281,10 @@ def main() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     version = f"black-v1-seed-{args.seed}-epochs-{args.epochs}"
 
-    orientation_path = MODEL_DIR / "document-orientation.int8.onnx"
-    print(f"Training orientation model ({args.epochs} epochs)", flush=True)
-    export_orientation(train_orientation(samples, args.epochs, args.seed, device), orientation_path, samples)
-    manifest = {
-        "version": 2,
-        "orientation": descriptor(orientation_path, "/models/document-orientation.int8.onnx", version, "orientation"),
-    }
-    (MODEL_DIR / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    orientation_path = MODEL_DIR / "pp-lcnet-x1-doc-orientation.onnx"
+    if not orientation_path.is_file():
+        raise SystemExit("Official PaddleOCR orientation model is missing; restore the verified repository asset.")
+    print("Production orientation uses the verified PaddleOCR PP-LCNet_x1_0_doc_ori asset; no local retraining performed.", flush=True)
 
     if args.include_handwriting_research:
         RESEARCH_MODEL_DIR.mkdir(parents=True, exist_ok=True)

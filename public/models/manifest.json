@@ -1,13 +1,25 @@
 {
-  "version": 2,
+  "version": 3,
   "orientation": {
     "status": "ready",
-    "version": "black-v1-seed-20250814-epochs-6",
-    "url": "/models/document-orientation.int8.onnx",
-    "sha256": "cabd0b74f4b61c15a49526889ca6a52ac6773de8851c96ea664ef9ca6173023f",
-    "sizeBytes": 41104,
-    "inputName": "input",
-    "outputName": "output",
-    "inputSize": 224
+    "version": "paddleocr-pp-lcnet-x1-0-doc-ori-onnx",
+    "url": "/models/pp-lcnet-x1-doc-orientation.onnx",
+    "sha256": "10453f80f6f50e8149161aef61b265119471e4010263a82682e5695914236f27",
+    "sizeBytes": 6781504,
+    "inputName": "x",
+    "outputName": "softmax_0.tmp_0",
+    "inputSize": 224,
+    "outputType": "probabilities",
+    "labelMode": "observed",
+    "autoThreshold": 0.7,
+    "marginThreshold": 0.15,
+    "preferPortrait": true,
+    "preprocess": {
+      "resizeShort": 256,
+      "cropSize": 224,
+      "channelOrder": "bgr",
+      "mean": [0.485, 0.456, 0.406],
+      "std": [0.229, 0.224, 0.225]
+    }
   }
 }

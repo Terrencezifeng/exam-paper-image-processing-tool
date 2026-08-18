@@ -10,6 +10,18 @@ type ModelDescriptor = {
   inputSize: number
   sha256?: string
   sizeBytes?: number
+  outputType?: 'logits' | 'probabilities'
+  labelMode?: 'correction' | 'observed'
+  autoThreshold?: number
+  marginThreshold?: number
+  preprocess?: {
+    resizeShort: number
+    cropSize: number
+    mean: [number, number, number]
+    std: [number, number, number]
+    channelOrder?: 'rgb' | 'bgr'
+  }
+  preferPortrait?: boolean
 }
 
 type ModelManifest = {
@@ -19,6 +31,8 @@ type ModelManifest = {
 export type OrientationPrediction = {
   rotation: Rotation
   confidence: number
+  confidenceMargin: number
+  accepted: boolean
   backend: InferenceBackend
   modelVersion?: string
 }
@@ -111,17 +125,48 @@ async function retryOnWasm<T>(
   }
 }
 
-function imageToTensor(image: ImageData, size: number, ort: OrtModule) {
+function bilinearChannel(image: ImageData, x: number, y: number, channel: number) {
+  const left = Math.max(0, Math.min(image.width - 1, Math.floor(x)))
+  const top = Math.max(0, Math.min(image.height - 1, Math.floor(y)))
+  const right = Math.min(image.width - 1, left + 1)
+  const bottom = Math.min(image.height - 1, top + 1)
+  const weightX = x - Math.floor(x)
+  const weightY = y - Math.floor(y)
+  const topValue = image.data[(top * image.width + left) * 4 + channel] * (1 - weightX) +
+    image.data[(top * image.width + right) * 4 + channel] * weightX
+  const bottomValue = image.data[(bottom * image.width + left) * 4 + channel] * (1 - weightX) +
+    image.data[(bottom * image.width + right) * 4 + channel] * weightX
+  return topValue * (1 - weightY) + bottomValue * weightY
+}
+
+function imageToTensor(image: ImageData, descriptor: ModelDescriptor, ort: OrtModule) {
+  const size = descriptor.inputSize
   const data = new Float32Array(3 * size * size)
+  const preprocessing = descriptor.preprocess
+  const resizeScale = preprocessing ? preprocessing.resizeShort / Math.min(image.width, image.height) : undefined
+  const resizedWidth = resizeScale ? Math.round(image.width * resizeScale) : size
+  const resizedHeight = resizeScale ? Math.round(image.height * resizeScale) : size
+  const cropOffsetX = (resizedWidth - (preprocessing?.cropSize ?? size)) / 2
+  const cropOffsetY = (resizedHeight - (preprocessing?.cropSize ?? size)) / 2
   for (let y = 0; y < size; y += 1) {
-    const sourceY = Math.min(image.height - 1, Math.floor((y / size) * image.height))
     for (let x = 0; x < size; x += 1) {
-      const sourceX = Math.min(image.width - 1, Math.floor((x / size) * image.width))
-      const source = (sourceY * image.width + sourceX) * 4
       const target = y * size + x
-      data[target] = image.data[source] / 255
-      data[size * size + target] = image.data[source + 1] / 255
-      data[size * size * 2 + target] = image.data[source + 2] / 255
+      if (preprocessing && resizeScale) {
+        const sourceX = (x + cropOffsetX + 0.5) * image.width / resizedWidth - 0.5
+        const sourceY = (y + cropOffsetY + 0.5) * image.height / resizedHeight - 0.5
+        for (let channel = 0; channel < 3; channel += 1) {
+          const sourceChannel = preprocessing.channelOrder === 'bgr' ? 2 - channel : channel
+          const normalized = bilinearChannel(image, sourceX, sourceY, sourceChannel) / 255
+          data[channel * size * size + target] = (normalized - preprocessing.mean[channel]) / preprocessing.std[channel]
+        }
+      } else {
+        const sourceX = Math.min(image.width - 1, Math.floor((x / size) * image.width))
+        const sourceY = Math.min(image.height - 1, Math.floor((y / size) * image.height))
+        const source = (sourceY * image.width + sourceX) * 4
+        data[target] = image.data[source] / 255
+        data[size * size + target] = image.data[source + 1] / 255
+        data[size * size * 2 + target] = image.data[source + 2] / 255
+      }
     }
   }
   return new ort.Tensor('float32', data, [1, 3, size, size])
@@ -131,22 +176,42 @@ export async function predictOrientation(image: ImageData): Promise<OrientationP
   try {
     const manifest = await loadManifest()
     const descriptor = manifest.orientation
-    if (descriptor.status !== 'ready') return { rotation: 0, confidence: 0, backend: 'unavailable' }
+    if (descriptor.status !== 'ready') return { rotation: 0, confidence: 0, confidenceMargin: 0, accepted: false, backend: 'unavailable' }
     const ort = await loadOrt()
     const { output, backend } = await retryOnWasm(descriptor, (session) => session.run({
-      [descriptor.inputName]: imageToTensor(image, descriptor.inputSize, ort),
+      [descriptor.inputName]: imageToTensor(image, descriptor, ort),
     }))
     const scores = Array.from(output[descriptor.outputName].data as Float32Array)
-    const probabilities = scores.map((score) => Math.exp(score - Math.max(...scores)))
-    const total = probabilities.reduce((sum, value) => sum + value, 0)
+    const probabilities = descriptor.outputType === 'probabilities'
+      ? scores
+      : scores.map((score) => Math.exp(score - Math.max(...scores)))
+    const total = descriptor.outputType === 'probabilities'
+      ? 1
+      : probabilities.reduce((sum, value) => sum + value, 0)
     const best = probabilities.indexOf(Math.max(...probabilities))
+    const confidence = probabilities[best] / total
+    const ordered = probabilities.map((value) => value / total).sort((a, b) => b - a)
+    const confidenceMargin = ordered[0] - (ordered[1] ?? 0)
+    const observed = ([0, 90, 180, 270] as Rotation[])[best] ?? 0
+    const rotation = descriptor.labelMode === 'observed'
+      ? ((360 - observed) % 360) as Rotation
+      : observed
+    const landscape = image.width / image.height > 1.12
+    const portrait = image.height / image.width > 1.12
+    const producesPortrait = landscape ? rotation === 90 || rotation === 270
+      : portrait ? rotation === 0 || rotation === 180
+      : true
     return {
-      rotation: ([0, 90, 180, 270] as Rotation[])[best] ?? 0,
-      confidence: probabilities[best] / total,
+      rotation,
+      confidence,
+      confidenceMargin,
+      accepted: confidence >= (descriptor.autoThreshold ?? 0.82) &&
+        confidenceMargin >= (descriptor.marginThreshold ?? 0) &&
+        (!descriptor.preferPortrait || producesPortrait),
       backend,
       modelVersion: descriptor.version,
     }
   } catch {
-    return { rotation: 0, confidence: 0, backend: 'unavailable' }
+    return { rotation: 0, confidence: 0, confidenceMargin: 0, accepted: false, backend: 'unavailable' }
   }
 }

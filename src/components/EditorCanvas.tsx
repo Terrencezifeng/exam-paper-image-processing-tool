@@ -1,4 +1,4 @@
-import { Maximize2, ZoomIn, ZoomOut } from 'lucide-react'
+import { Check, Maximize2, ZoomIn, ZoomOut } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { drawStroke, loadImage, renderEditedPage } from '../lib/image-processing'
 import type { EditorTool, Point, Stroke, WorksheetPage } from '../types'
@@ -24,12 +24,14 @@ export function EditorCanvas({
   size,
   compare,
   onStroke,
+  onConfirmReview,
 }: {
   page: WorksheetPage
   tool: EditorTool
   size: number
   compare: boolean
   onStroke: (stroke: Stroke) => void
+  onConfirmReview: () => void
 }) {
   const viewportRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -270,7 +272,7 @@ export function EditorCanvas({
         <canvas ref={canvasRef} aria-label="试卷编辑画布" />
         <canvas ref={overlayRef} className="drawing-overlay" aria-hidden="true" />
       </div>
-      {page.diagnostics.warning && <div className="canvas-warning">{page.diagnostics.warning}</div>}
+      {page.reviewReasons.length > 0 && !page.reviewConfirmed && <div className="canvas-warning"><span>{page.diagnostics.warning ?? '请核对当前页面的方向和纸张边界'}</span><button className="canvas-confirm" onPointerDown={(event) => event.stopPropagation()} onClick={onConfirmReview}><Check />已确认本页</button></div>}
       {compare && <span className="compare-label">手动修改前</span>}
       <div className="zoom-controls" aria-label="缩放控制">
         <button onClick={() => zoomFromCenter(0.8)} title="缩小" aria-label="缩小"><ZoomOut /></button>

@@ -1,16 +1,18 @@
-import type { PersistedBinary, PersistedPage, PersistedTask, WorksheetPage } from '../types'
+import type { EnhancementPreset, PersistedBinary, PersistedPage, PersistedTask, ReviewReason, WorksheetPage } from '../types'
 
 const DB_NAME = 'jingjuan-local'
 const STORE_NAME = 'tasks'
 const TASK_ID = 'active-task'
 const MAX_AGE = 24 * 60 * 60 * 1000
-const TASK_VERSION = 3 as const
+const TASK_VERSION = 4 as const
 let requiresBinaryRecords = false
 
 const defaultDiagnostics = {
   autoRotation: 0 as const,
   effectiveRotation: 0 as const,
   orientationConfidence: 0,
+  orientationMargin: 0,
+  orientationAccepted: false,
   boundaryConfidence: 0,
   boundaryAccepted: false,
   orientationBackend: 'unavailable' as const,
@@ -43,11 +45,12 @@ function transaction<T>(mode: IDBTransactionMode, operation: (store: IDBObjectSt
   )
 }
 
-export async function saveTask(pages: WorksheetPage[]) {
+export async function saveTask(pages: WorksheetPage[], defaultEnhancementPreset: EnhancementPreset = 'clear') {
   const createTask = async (useBinaryRecords: boolean): Promise<PersistedTask> => ({
     id: TASK_ID,
     version: TASK_VERSION,
     updatedAt: Date.now(),
+    defaultEnhancementPreset,
     pages: await Promise.all(pages.map((page) => toPersistedPage(page, useBinaryRecords))),
   })
   try {
@@ -87,6 +90,9 @@ async function toPersistedPage(page: WorksheetPage, useBinaryRecords: boolean): 
     progress: page.progress,
     rotation: page.rotation,
     autoRotation: page.autoRotation,
+    enhancementPreset: page.enhancementPreset,
+    reviewReasons: page.reviewReasons,
+    reviewConfirmed: page.reviewConfirmed,
     corners: page.corners,
     processingStage: page.processingStage,
     enhanced: await storeBinary(page.enhanced, useBinaryRecords),
@@ -110,29 +116,43 @@ type LegacyPage = Omit<Partial<PersistedPage>, 'processingStage' | 'status' | 'd
   }
 }
 
-export async function loadTask(): Promise<WorksheetPage[]> {
-  const task = await transaction<(Partial<PersistedTask> & { updatedAt: number; pages: LegacyPage[] }) | undefined>('readonly', (store) => store.get(TASK_ID))
-  if (!task) return []
+export async function loadTask(): Promise<{ pages: WorksheetPage[]; defaultEnhancementPreset: EnhancementPreset }> {
+  const task = await transaction<(Omit<Partial<PersistedTask>, 'version' | 'pages'> & { version?: number; updatedAt: number; pages: LegacyPage[] }) | undefined>('readonly', (store) => store.get(TASK_ID))
+  if (!task) return { pages: [], defaultEnhancementPreset: 'clear' }
   if (Date.now() - task.updatedAt > MAX_AGE) {
     await clearTask()
-    return []
+    return { pages: [], defaultEnhancementPreset: 'clear' }
   }
-  const legacyTask = task.version !== TASK_VERSION
-  return task.pages.map((page) => {
+  const version = task.version ?? 2
+  const preV3Task = version < 3
+  const preV4Task = version < 4
+  const pages = task.pages.map((page) => {
     const source = restoreBinary(page.source)!
     const sourcePreview = restoreBinary(page.sourcePreview)
     const storedEnhanced = restoreBinary(page.enhanced)
     const storedProcessed = restoreBinary(page.processed)
-    const legacyBaseline = legacyTask ? storedEnhanced : storedProcessed
     const enhanced = storedEnhanced
-    const processed = legacyBaseline
-    const needsReprocessing = legacyTask && !enhanced
+    const processed = preV3Task ? storedEnhanced : storedProcessed
+    const needsReprocessing = preV3Task && !enhanced
     const diagnostics = page.diagnostics
+    const orientationAccepted = diagnostics?.orientationAccepted ?? (
+      (diagnostics?.orientationConfidence ?? 0) >= 0.7 &&
+      (diagnostics?.orientationMargin ?? 0) >= 0.15 &&
+      diagnostics?.orientationBackend !== 'unavailable' &&
+      !diagnostics?.warning?.includes('方向')
+    )
+    const inferredReviewReasons = [
+      !orientationAccepted ? 'orientation' : undefined,
+      !(diagnostics?.boundaryAccepted ?? false) ? 'boundary' : undefined,
+    ].filter((reason): reason is ReviewReason => Boolean(reason))
     return {
       ...page,
       sourceWidth: page.sourceWidth ?? page.width,
       sourceHeight: page.sourceHeight ?? page.height,
       autoRotation: page.autoRotation ?? 0,
+      enhancementPreset: preV4Task ? 'soft' : (page.enhancementPreset ?? 'clear'),
+      reviewReasons: page.reviewReasons ?? inferredReviewReasons,
+      reviewConfirmed: page.reviewConfirmed ?? false,
       processingStage: needsReprocessing
         ? 'queued'
         : String(page.processingStage) === 'erasure' ? 'compositing' : (page.processingStage ?? 'queued'),
@@ -143,10 +163,12 @@ export async function loadTask(): Promise<WorksheetPage[]> {
         autoRotation: diagnostics?.autoRotation ?? page.autoRotation ?? 0,
         effectiveRotation: diagnostics?.effectiveRotation ?? page.rotation ?? 0,
         orientationConfidence: diagnostics?.orientationConfidence ?? 0,
+        orientationMargin: diagnostics?.orientationMargin ?? 0,
+        orientationAccepted,
         boundaryConfidence: diagnostics?.boundaryConfidence ?? 0,
         boundaryAccepted: diagnostics?.boundaryAccepted ?? false,
-        orientationBackend: legacyTask ? 'unavailable' : (diagnostics?.orientationBackend ?? 'unavailable'),
-        orientationModelVersion: legacyTask ? undefined : diagnostics?.orientationModelVersion,
+        orientationBackend: preV3Task ? 'unavailable' : (diagnostics?.orientationBackend ?? 'unavailable'),
+        orientationModelVersion: preV3Task ? undefined : diagnostics?.orientationModelVersion,
         warning: diagnostics?.warning,
       },
       strokes: page.strokes ?? [],
@@ -165,6 +187,10 @@ export async function loadTask(): Promise<WorksheetPage[]> {
       processedUrl: processed ? URL.createObjectURL(processed) : undefined,
     } as WorksheetPage
   })
+  const defaultEnhancementPreset = preV4Task
+    ? 'soft'
+    : (task.defaultEnhancementPreset ?? pages[0]?.enhancementPreset ?? 'clear')
+  return { pages, defaultEnhancementPreset }
 }
 
 export async function clearTask() {

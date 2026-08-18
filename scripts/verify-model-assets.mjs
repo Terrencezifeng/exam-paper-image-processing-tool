@@ -20,6 +20,17 @@ async function verifyDescriptor(kind, descriptor, limit, includedInProductionBud
   if (modelStat.size !== descriptor.sizeBytes) throw new Error(`${kind} model size does not match manifest`)
   const digest = createHash('sha256').update(await readFile(modelPath)).digest('hex')
   if (digest !== descriptor.sha256) throw new Error(`${kind} model hash does not match manifest`)
+  if (kind === 'orientation') {
+    if (descriptor.outputType !== 'probabilities' || descriptor.labelMode !== 'observed') {
+      throw new Error('orientation model output semantics are missing')
+    }
+    if (descriptor.autoThreshold < 0.7 || descriptor.marginThreshold < 0.15) {
+      throw new Error('orientation safety thresholds are too low')
+    }
+    if (descriptor.preprocess?.resizeShort !== 256 || descriptor.preprocess?.cropSize !== 224) {
+      throw new Error('orientation preprocessing does not match PaddleOCR')
+    }
+  }
   if (includedInProductionBudget) total += modelStat.size
   console.log(`${kind}: ready (${(modelStat.size / 1024 / 1024).toFixed(2)} MB)`)
 }

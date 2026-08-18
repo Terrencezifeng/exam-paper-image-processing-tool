@@ -34,7 +34,7 @@ import { EditorCanvas } from './components/EditorCanvas'
 import { IMAGE_ACCEPT, MAX_FILES, splitValidFiles } from './lib/files'
 import { processWorksheetInWorker } from './lib/processing-client'
 import { clearTask, loadTask, saveTask } from './lib/storage'
-import type { EditorTool, ExportSettings, Point, Stroke, WorksheetPage } from './types'
+import type { EditorTool, EnhancementPreset, ExportSettings, Point, ReviewReason, Stroke, WorksheetPage } from './types'
 
 const initialExportSettings: ExportSettings = {
   quality: 'standard',
@@ -49,6 +49,15 @@ const statusLabel = {
   failed: '处理失败',
   cancelled: '已取消',
 } as const
+
+const reviewReasonLabel: Record<ReviewReason, string> = {
+  orientation: '方向待确认',
+  boundary: '边界待确认',
+}
+
+function needsReview(page: WorksheetPage) {
+  return page.reviewReasons.length > 0 && !page.reviewConfirmed
+}
 
 function createId() {
   return crypto.randomUUID()
@@ -73,7 +82,10 @@ function App() {
   const [showExport, setShowExport] = useState(false)
   const [exporting, setExporting] = useState(0)
   const [exportSettings, setExportSettings] = useState(initialExportSettings)
+  const [defaultEnhancementPreset, setDefaultEnhancementPreset] = useState<EnhancementPreset>('clear')
+  const [batchEnhancement, setBatchEnhancement] = useState<{ preset: EnhancementPreset; completed: number; total: number }>()
   const controllers = useRef(new Map<string, AbortController>())
+  const cancelBatchEnhancement = useRef(false)
   const saveTimer = useRef<number | undefined>(undefined)
   const pagesRef = useRef(pages)
 
@@ -84,8 +96,9 @@ function App() {
   useEffect(() => {
     void loadTask()
       .then((restored) => {
-        setPages(restored)
-        setSelectedId(restored[0]?.id)
+        setPages(restored.pages)
+        setDefaultEnhancementPreset(restored.defaultEnhancementPreset)
+        setSelectedId(restored.pages[0]?.id)
       })
       .catch(() => setNotice('未能恢复上次任务，你仍可新建任务'))
       .finally(() => setRestoring(false))
@@ -95,10 +108,10 @@ function App() {
     if (restoring) return
     window.clearTimeout(saveTimer.current)
     saveTimer.current = window.setTimeout(() => {
-      void saveTask(pages).catch((error) => setNotice(`本地任务保存失败：${error instanceof Error ? error.message : '浏览器存储不可用'}`))
+      void saveTask(pages, defaultEnhancementPreset).catch((error) => setNotice(`本地任务保存失败：${error instanceof Error ? error.message : '浏览器存储不可用'}`))
     }, 700)
     return () => window.clearTimeout(saveTimer.current)
-  }, [pages, restoring])
+  }, [defaultEnhancementPreset, pages, restoring])
 
   useEffect(
     () => () => {
@@ -111,14 +124,21 @@ function App() {
   const selected = pages.find((page) => page.id === selectedId) ?? pages[0]
   const finishedPages = pages.filter((page) => page.status === 'ready')
   const processingCount = pages.filter((page) => page.status === 'processing').length
-  const queueBusy = pages.some((page) => page.status === 'queued' || page.status === 'processing')
+  const queueBusy = Boolean(batchEnhancement) || pages.some((page) => page.status === 'queued' || page.status === 'processing')
+  const pendingReviewPages = finishedPages.filter(needsReview)
 
   const replacePage = useCallback((id: string, updater: (page: WorksheetPage) => WorksheetPage) => {
     setPages((current) => current.map((page) => (page.id === id ? updater(page) : page)))
   }, [])
 
   const runPage = useCallback(
-    async (page: WorksheetPage, overrides?: Partial<Pick<WorksheetPage, 'corners' | 'rotation'>>) => {
+    async (page: WorksheetPage, overrides?: {
+      corners?: Point[]
+      rotation?: WorksheetPage['rotation']
+      enhancementPreset?: EnhancementPreset
+      lockGeometry?: boolean
+      preserveEdits?: boolean
+    }) => {
       controllers.current.get(page.id)?.abort()
       const controller = new AbortController()
       controllers.current.set(page.id, controller)
@@ -127,13 +147,29 @@ function App() {
         status: 'processing',
         progress: 2,
         error: undefined,
-        ...overrides,
+        corners: overrides?.corners ?? current.corners,
+        rotation: overrides?.rotation ?? current.rotation,
+        enhancementPreset: overrides?.enhancementPreset ?? current.enhancementPreset,
       }))
       try {
         const requestId = `${page.id}:${crypto.randomUUID()}`
         const result = await processWorksheetInWorker(requestId, page.source, {
           corners: overrides?.corners ?? (page.processed ? page.corners : undefined),
           rotation: overrides?.rotation ?? page.rotation,
+          enhancementPreset: overrides?.enhancementPreset ?? page.enhancementPreset,
+          lockedGeometry: overrides?.lockGeometry ? {
+            corners: page.corners,
+            autoRotation: page.autoRotation,
+            effectiveRotation: page.diagnostics.effectiveRotation,
+            orientationConfidence: page.diagnostics.orientationConfidence,
+            orientationMargin: page.diagnostics.orientationMargin,
+            orientationAccepted: page.diagnostics.orientationAccepted,
+            boundaryConfidence: page.diagnostics.boundaryConfidence,
+            boundaryAccepted: page.diagnostics.boundaryAccepted,
+            orientationBackend: page.diagnostics.orientationBackend,
+            orientationModelVersion: page.diagnostics.orientationModelVersion,
+            warning: page.diagnostics.warning,
+          } : undefined,
           signal: controller.signal,
           onProgress: (progress, processingStage) => replacePage(page.id, (current) => ({ ...current, progress, processingStage })),
         })
@@ -143,7 +179,8 @@ function App() {
           if (current.processedUrl) URL.revokeObjectURL(current.processedUrl)
           return {
             ...current,
-            ...overrides,
+            rotation: overrides?.rotation ?? current.rotation,
+            enhancementPreset: overrides?.enhancementPreset ?? current.enhancementPreset,
             sourcePreview: result.sourcePreview,
             sourcePreviewUrl: URL.createObjectURL(result.sourcePreview),
             sourceWidth: result.sourceWidth,
@@ -157,8 +194,13 @@ function App() {
             corners: result.corners,
             autoRotation: result.diagnostics.autoRotation,
             diagnostics: result.diagnostics,
-            strokes: [],
-            undoneStrokes: [],
+            reviewReasons: overrides?.lockGeometry ? current.reviewReasons : [
+              !result.diagnostics.orientationAccepted ? 'orientation' as const : undefined,
+              !result.diagnostics.boundaryAccepted ? 'boundary' as const : undefined,
+            ].filter((reason): reason is ReviewReason => Boolean(reason)),
+            reviewConfirmed: overrides?.lockGeometry ? current.reviewConfirmed : false,
+            strokes: overrides?.preserveEdits ? current.strokes : [],
+            undoneStrokes: overrides?.preserveEdits ? current.undoneStrokes : [],
             progress: 100,
             processingStage: 'compositing',
             status: 'ready',
@@ -179,6 +221,44 @@ function App() {
     },
     [replacePage],
   )
+
+  const applyEnhancementToAll = useCallback(async (preset: EnhancementPreset) => {
+    if (batchEnhancement || pagesRef.current.some((page) => page.status === 'queued' || page.status === 'processing')) return
+    const snapshot = pagesRef.current
+    const targets = snapshot.filter((page) => page.status === 'ready' && page.enhancementPreset !== preset)
+    cancelBatchEnhancement.current = false
+    setDefaultEnhancementPreset(preset)
+    setPages((current) => current.map((page) => page.status === 'ready' ? page : { ...page, enhancementPreset: preset }))
+    if (targets.length === 0) {
+      setNotice(`全部页面已经是${preset === 'soft' ? '柔和' : preset === 'clear' ? '清晰' : '高对比'}档`)
+      return
+    }
+    setBatchEnhancement({ preset, completed: 0, total: targets.length })
+    let completed = 0
+    for (const target of targets) {
+      if (cancelBatchEnhancement.current) break
+      await runPage(target, { enhancementPreset: preset, lockGeometry: true, preserveEdits: true })
+      completed += 1
+      setBatchEnhancement((current) => current ? { ...current, completed } : current)
+    }
+    const cancelled = cancelBatchEnhancement.current
+    setBatchEnhancement(undefined)
+    setNotice(cancelled ? `已停止批量增强，完成 ${completed} / ${targets.length} 页` : `已将 ${targets.length} 页批量设为${preset === 'soft' ? '柔和' : preset === 'clear' ? '清晰' : '高对比'}`)
+  }, [batchEnhancement, runPage])
+
+  function stopBatchEnhancement() {
+    cancelBatchEnhancement.current = true
+    controllers.current.forEach((controller) => controller.abort())
+  }
+
+  function confirmPage(page: WorksheetPage) {
+    replacePage(page.id, (current) => ({ ...current, reviewConfirmed: true }))
+  }
+
+  function reviewPage(id: string) {
+    setShowExport(false)
+    setSelectedId(id)
+  }
 
   useEffect(() => {
     if (restoring || processingCount > 0 || controllers.current.size > 0) return
@@ -203,6 +283,9 @@ function App() {
       progress: 0,
       rotation: 0,
       autoRotation: 0,
+      enhancementPreset: defaultEnhancementPreset,
+      reviewReasons: [],
+      reviewConfirmed: false,
       corners: [
         { x: 0, y: 0 },
         { x: 1, y: 0 },
@@ -214,6 +297,8 @@ function App() {
         autoRotation: 0,
         effectiveRotation: 0,
         orientationConfidence: 0,
+        orientationMargin: 0,
+        orientationAccepted: false,
         boundaryConfidence: 0,
         boundaryAccepted: false,
         orientationBackend: 'unavailable',
@@ -301,6 +386,7 @@ function App() {
     pages.forEach(revokePageUrls)
     setPages([])
     setSelectedId(undefined)
+    setDefaultEnhancementPreset('clear')
     await clearTask()
   }
 
@@ -357,17 +443,32 @@ function App() {
               {selected?.status === 'processing' || selected?.status === 'queued' ? (
                 <ProcessingView page={selected} onCancel={() => controllers.current.get(selected.id)?.abort()} />
               ) : selected?.processedUrl && selected.enhancedUrl ? (
-                <EditorCanvas page={selected} tool={tool} size={brushSize} compare={compare} onStroke={addStroke} />
+                <EditorCanvas page={selected} tool={tool} size={brushSize} compare={compare} onStroke={addStroke} onConfirmReview={() => confirmPage(selected)} />
               ) : (
                 <FailureView page={selected} onRetry={() => selected && void runPage(selected)} />
               )}
             </div>
             <div className="page-nav"><button onClick={() => selectRelative(-1)} disabled={selectedIndex <= 0}><ChevronLeft />上一页</button><span>{selectedIndex + 1} / {pages.length}</span><button onClick={() => selectRelative(1)} disabled={selectedIndex >= pages.length - 1}>下一页<ChevronRight /></button></div>
-            <MobileToolDock tool={tool} size={brushSize} canUndo={Boolean(selected?.strokes.length)} canRedo={Boolean(selected?.undoneStrokes.length)} onTool={setTool} onSize={setBrushSize} onUndo={undo} onRedo={redo} />
+            <MobileToolDock
+              tool={tool}
+              size={brushSize}
+              preset={selected?.enhancementPreset ?? 'clear'}
+              processing={selected?.status === 'processing'}
+              batch={batchEnhancement}
+              canUndo={Boolean(selected?.strokes.length)}
+              canRedo={Boolean(selected?.undoneStrokes.length)}
+              onTool={setTool}
+              onSize={setBrushSize}
+              onPreset={(enhancementPreset) => selected && void runPage(selected, { enhancementPreset, lockGeometry: true, preserveEdits: true })}
+              onApplyAll={(preset) => void applyEnhancementToAll(preset)}
+              onStopBatch={stopBatchEnhancement}
+              onUndo={undo}
+              onRedo={redo}
+            />
           </section>
           <aside className="tool-panel">
             <div className="panel-heading"><div><WandSparkles /><span><strong>页面工具</strong><small>所有手动修改都可以恢复</small></span></div></div>
-            {selected?.diagnostics.warning && <div className="warning-card"><CircleAlert /><div><strong>请确认页面</strong><span>{selected.diagnostics.warning}</span></div></div>}
+            {selected && needsReview(selected) && <div className="warning-card"><CircleAlert /><div><strong>请确认页面</strong><span>{selected.reviewReasons.map((reason) => reviewReasonLabel[reason]).join('、')}{selected.diagnostics.warning ? `。${selected.diagnostics.warning}` : ''}</span><button onClick={() => confirmPage(selected)}><Check />已确认本页</button></div></div>}
             <ToolSection title="校正">
               <div className="button-grid">
                 <button onClick={() => selected && setCropPage(selected)}><Crop />调整边界</button>
@@ -376,7 +477,28 @@ function App() {
               </div>
             </ToolSection>
             <ToolSection title="画面增强">
-              <div className="enhancement-state"><Sparkles /><span><strong>灰度清晰</strong><small>已均衡光照并保留公式与细线</small></span></div>
+              <div className="enhancement-heading"><Sparkles /><span>灰度文字增强</span></div>
+              <div className="enhancement-presets" role="group" aria-label="文字增强强度">
+                {([
+                  ['soft', '柔和'],
+                  ['clear', '清晰'],
+                  ['highContrast', '高对比'],
+                ] as const).map(([preset, label]) => (
+                  <button
+                    key={preset}
+                    className={selected?.enhancementPreset === preset ? 'selected' : ''}
+                    disabled={!selected || selected.status === 'processing' || Boolean(batchEnhancement)}
+                    onClick={() => selected && void runPage(selected, {
+                      enhancementPreset: preset,
+                      lockGeometry: true,
+                      preserveEdits: true,
+                    })}
+                    aria-pressed={selected?.enhancementPreset === preset}
+                  >{label}</button>
+                ))}
+              </div>
+              {batchEnhancement ? <div className="batch-enhancement"><span>正在更新 {batchEnhancement.completed} / {batchEnhancement.total} 页</span><button onClick={stopBatchEnhancement}>停止</button></div> : <button className="apply-all-enhancement" disabled={!selected || queueBusy} onClick={() => selected && void applyEnhancementToAll(selected.enhancementPreset)}>应用到全部 {pages.length} 页</button>}
+              <small className="enhancement-note">均衡光照并保留公式、表格线与浅色细节</small>
             </ToolSection>
             <ToolSection title="手动补修">
               <ToolChoice tool={tool} onTool={setTool} />
@@ -389,7 +511,7 @@ function App() {
       )}
 
       {cropPage && <CropDialog page={cropPage} onClose={() => setCropPage(undefined)} onApply={(corners) => { setCropPage(undefined); void runPage(cropPage, { corners }) }} />}
-      {showExport && <ExportDialog pages={finishedPages} settings={exportSettings} progress={exporting} onChange={setExportSettings} onClose={() => setShowExport(false)} onExport={() => void startExport()} />}
+      {showExport && <ExportDialog pages={finishedPages} pendingReviewPages={pendingReviewPages} settings={exportSettings} progress={exporting} onChange={setExportSettings} onReviewPage={reviewPage} onClose={() => setShowExport(false)} onExport={() => void startExport()} />}
     </div>
   )
 }
@@ -408,15 +530,16 @@ function Welcome({ onFiles }: { onFiles: (files: File[]) => void }) {
 function PageRail({ pages, selectedId, onSelect, onAdd, onMove, onReorder, onDelete }: { pages: WorksheetPage[]; selectedId?: string; onSelect: (id: string) => void; onAdd: (files: File[]) => void; onMove: (id: string, direction: -1 | 1) => void; onReorder: (sourceId: string, targetId: string) => void; onDelete: (id: string) => void }) {
   const input = useRef<HTMLInputElement>(null)
   const [draggedId, setDraggedId] = useState<string>()
-  return <aside className="page-rail"><div className="rail-title"><div><strong>页面</strong><span>{pages.length} / {MAX_FILES}</span></div><button onClick={() => input.current?.click()} aria-label="继续添加图片"><ImagePlus /></button><FileInput inputRef={input} onFiles={onAdd} /></div><div className="page-list">{pages.map((page, index) => <div key={page.id} draggable className={`page-thumb ${page.id === selectedId ? 'active' : ''}`} onDragStart={() => setDraggedId(page.id)} onDragEnd={() => setDraggedId(undefined)} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (draggedId) onReorder(draggedId, page.id); setDraggedId(undefined) }} onClick={() => onSelect(page.id)}><GripVertical className="grip" /><div className="thumb-image">{page.processedUrl || page.sourcePreviewUrl || page.sourceUrl ? <img src={page.processedUrl ?? page.sourcePreviewUrl ?? page.sourceUrl} alt="" /> : <FileImage />}<span>{index + 1}</span></div><div className="thumb-copy"><strong>{page.name}</strong><small className={`status ${page.status}`}>{page.status === 'processing' && <LoaderCircle className="spin" />}{statusLabel[page.status]}</small></div><div className="thumb-actions"><button onClick={(event) => { event.stopPropagation(); onMove(page.id, -1) }} disabled={index === 0} aria-label="上移"><ArrowUp /></button><button onClick={(event) => { event.stopPropagation(); onMove(page.id, 1) }} disabled={index === pages.length - 1} aria-label="下移"><ArrowDown /></button><button onClick={(event) => { event.stopPropagation(); onDelete(page.id) }} aria-label="删除"><Trash2 /></button></div></div>)}</div></aside>
+  const reviewCount = pages.filter(needsReview).length
+  return <aside className="page-rail"><div className="rail-title"><div><strong>页面</strong><span>{pages.length} / {MAX_FILES}</span>{reviewCount > 0 && <span className="rail-review-count" title={`${reviewCount} 页待确认`}><CircleAlert />{reviewCount}</span>}</div><button onClick={() => input.current?.click()} aria-label="继续添加图片"><ImagePlus /></button><FileInput inputRef={input} onFiles={onAdd} /></div><div className="page-list">{pages.map((page, index) => <div key={page.id} draggable className={`page-thumb ${page.id === selectedId ? 'active' : ''} ${needsReview(page) ? 'needs-review' : ''}`} onDragStart={() => setDraggedId(page.id)} onDragEnd={() => setDraggedId(undefined)} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (draggedId) onReorder(draggedId, page.id); setDraggedId(undefined) }} onClick={() => onSelect(page.id)}><GripVertical className="grip" /><div className="thumb-image">{page.processedUrl || page.sourcePreviewUrl || page.sourceUrl ? <img src={page.processedUrl ?? page.sourcePreviewUrl ?? page.sourceUrl} alt="" /> : <FileImage />}{needsReview(page) && <span className="review-marker" aria-label={page.reviewReasons.map((reason) => reviewReasonLabel[reason]).join('、')} title={page.reviewReasons.map((reason) => reviewReasonLabel[reason]).join('、')}><CircleAlert /></span>}<span>{index + 1}</span></div><div className="thumb-copy"><strong>{page.name}</strong><small className={`status ${needsReview(page) ? 'review-pending' : page.status}`}>{page.status === 'processing' && <LoaderCircle className="spin" />}{needsReview(page) ? '待确认' : statusLabel[page.status]}</small></div><div className="thumb-actions"><button onClick={(event) => { event.stopPropagation(); onMove(page.id, -1) }} disabled={index === 0} aria-label="上移"><ArrowUp /></button><button onClick={(event) => { event.stopPropagation(); onMove(page.id, 1) }} disabled={index === pages.length - 1} aria-label="下移"><ArrowDown /></button><button onClick={(event) => { event.stopPropagation(); onDelete(page.id) }} aria-label="删除"><Trash2 /></button></div></div>)}</div></aside>
 }
 
 function ToolChoice({ tool, onTool }: { tool: EditorTool; onTool: (tool: EditorTool) => void }) {
   return <div className="tool-choice"><button className={tool === 'pan' ? 'active' : ''} onClick={() => onTool('pan')}><Move />移动</button><button className={tool === 'eraser' ? 'active' : ''} onClick={() => onTool('eraser')}><Eraser />擦除</button><button className={tool === 'restore' ? 'active' : ''} onClick={() => onTool('restore')}><RefreshCw />恢复</button></div>
 }
 
-function MobileToolDock({ tool, size, canUndo, canRedo, onTool, onSize, onUndo, onRedo }: { tool: EditorTool; size: number; canUndo: boolean; canRedo: boolean; onTool: (tool: EditorTool) => void; onSize: (size: number) => void; onUndo: () => void; onRedo: () => void }) {
-  return <div className="mobile-tool-dock"><ToolChoice tool={tool} onTool={onTool} /><div className="mobile-brush"><input aria-label="笔刷大小" type="range" min="8" max="96" value={size} onChange={(event) => onSize(Number(event.target.value))} /><button onClick={onUndo} disabled={!canUndo} aria-label="撤销"><Undo2 /></button><button onClick={onRedo} disabled={!canRedo} aria-label="重做"><Redo2 /></button></div></div>
+function MobileToolDock({ tool, size, preset, processing, batch, canUndo, canRedo, onTool, onSize, onPreset, onApplyAll, onStopBatch, onUndo, onRedo }: { tool: EditorTool; size: number; preset: EnhancementPreset; processing: boolean; batch?: { preset: EnhancementPreset; completed: number; total: number }; canUndo: boolean; canRedo: boolean; onTool: (tool: EditorTool) => void; onSize: (size: number) => void; onPreset: (preset: EnhancementPreset) => void; onApplyAll: (preset: EnhancementPreset) => void; onStopBatch: () => void; onUndo: () => void; onRedo: () => void }) {
+  return <div className="mobile-tool-dock"><div className="mobile-enhancement"><Sparkles /><span>增强</span>{batch ? <span className="mobile-batch-status">{batch.completed}/{batch.total}</span> : <select aria-label="文字增强强度" value={preset} disabled={processing} onChange={(event) => onPreset(event.target.value as EnhancementPreset)}><option value="soft">柔和</option><option value="clear">清晰</option><option value="highContrast">高对比</option></select>}<button onClick={() => batch ? onStopBatch() : onApplyAll(preset)} disabled={!batch && processing} aria-label={batch ? '停止批量增强' : '应用当前增强到全部页面'}>{batch ? '停止' : '全部'}</button></div><ToolChoice tool={tool} onTool={onTool} /><div className="mobile-brush"><input aria-label="笔刷大小" type="range" min="8" max="96" value={size} onChange={(event) => onSize(Number(event.target.value))} /><button onClick={onUndo} disabled={!canUndo} aria-label="撤销"><Undo2 /></button><button onClick={onRedo} disabled={!canRedo} aria-label="重做"><Redo2 /></button></div></div>
 }
 
 const stageLabel = { queued: '准备处理', decoding: '解码图片', orientation: '识别页面方向', boundary: '检测纸张边界', enhancement: '均衡光照并增强文字', compositing: '生成灰度页面' } as const
@@ -436,10 +559,10 @@ function CropDialog({ page, onClose, onApply }: { page: WorksheetPage; onClose: 
   return <div className="modal-backdrop"><div ref={dialog} tabIndex={-1} className="modal crop-modal" role="dialog" aria-modal="true" aria-labelledby="crop-title"><div className="modal-header"><div><h2 id="crop-title">调整试卷边界</h2><p>拖动四个圆点，使边框贴合纸张四角</p></div><button onClick={onClose} aria-label="关闭"><X /></button></div><div ref={stage} className="crop-stage" style={{ aspectRatio: `${page.sourceWidth} / ${page.sourceHeight}` }} onPointerMove={move} onPointerUp={() => setDragging(undefined)} onPointerCancel={() => setDragging(undefined)}><img src={page.sourcePreviewUrl ?? page.sourceUrl} alt="原始试卷" /><svg viewBox="0 0 100 100" preserveAspectRatio="none"><polygon points={corners.map((point) => `${point.x * 100},${point.y * 100}`).join(' ')} /></svg>{corners.map((point, index) => <button key={index} className="crop-handle" style={{ left: `${point.x * 100}%`, top: `${point.y * 100}%` }} onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); setDragging(index) }} aria-label={`第 ${index + 1} 个角点`} />)}</div><div className="modal-actions"><button className="secondary" onClick={onClose}>取消</button><button className="primary" onClick={() => onApply(corners)}><Crop />应用校正</button></div></div></div>
 }
 
-function ExportDialog({ pages, settings, progress, onChange, onClose, onExport }: { pages: WorksheetPage[]; settings: ExportSettings; progress: number; onChange: (settings: ExportSettings) => void; onClose: () => void; onExport: () => void }) {
+function ExportDialog({ pages, pendingReviewPages, settings, progress, onChange, onReviewPage, onClose, onExport }: { pages: WorksheetPage[]; pendingReviewPages: WorksheetPage[]; settings: ExportSettings; progress: number; onChange: (settings: ExportSettings) => void; onReviewPage: (id: string) => void; onClose: () => void; onExport: () => void }) {
   const preview = pages[0]?.processedUrl
   const dialog = useDialogFocus(progress > 0 ? () => undefined : onClose)
-  return <div className="modal-backdrop"><div ref={dialog} tabIndex={-1} className="modal export-modal" role="dialog" aria-modal="true" aria-labelledby="export-title"><div className="modal-header"><div><h2 id="export-title">导出 A4 PDF</h2><p>{pages.length} 页将按当前顺序合并</p></div><button onClick={onClose} disabled={progress > 0} aria-label="关闭"><X /></button></div><div className="export-content"><div className="paper-preview">{preview && <img src={preview} alt="PDF 首页面预览" />}<span>A4 竖版 · 灰度 · 第 1 页</span></div><div className="export-options"><label>文件名<input value={settings.filename} maxLength={80} onChange={(event) => onChange({ ...settings, filename: event.target.value })} /></label><fieldset><legend>清晰度</legend><div className="quality-options">{([['clear','清晰','适合打印'],['standard','标准','推荐'],['small','小文件','适合分享']] as const).map(([value,label,help]) => <button key={value} className={settings.quality === value ? 'active' : ''} onClick={() => onChange({ ...settings, quality: value })}><strong>{label}</strong><small>{help}</small></button>)}</div></fieldset><label>页边距<select value={settings.margin} onChange={(event) => onChange({ ...settings, margin: Number(event.target.value) as ExportSettings['margin'] })}><option value={6}>窄（6 mm）</option><option value={12}>标准（12 mm）</option><option value={18}>宽（18 mm）</option></select></label><div className="export-safe"><ShieldCheck /><span>PDF 在浏览器本地生成，不会上传图片</span></div></div></div>{progress > 0 && <div className="export-progress"><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>正在生成 {progress}%</span></div>}<div className="modal-actions"><button className="secondary" onClick={onClose} disabled={progress > 0}>取消</button><button className="primary" onClick={onExport} disabled={progress > 0}><Download />{progress > 0 ? '正在生成…' : '下载 PDF'}</button></div></div></div>
+  return <div className="modal-backdrop"><div ref={dialog} tabIndex={-1} className="modal export-modal" role="dialog" aria-modal="true" aria-labelledby="export-title"><div className="modal-header"><div><h2 id="export-title">导出 A4 PDF</h2><p>{pages.length} 页将按当前顺序合并{pendingReviewPages.length > 0 ? ` · ${pendingReviewPages.length} 页待确认` : ''}</p></div><button onClick={onClose} disabled={progress > 0} aria-label="关闭"><X /></button></div><div className="export-content"><div className="paper-preview">{preview && <img src={preview} alt="PDF 首页面预览" />}<span>A4 竖版 · 灰度 · 第 1 页</span></div><div className="export-options">{pendingReviewPages.length > 0 && <div className="export-review-warning" role="alert"><CircleAlert /><div><strong>PDF 中有 {pendingReviewPages.length} 页尚未确认</strong><span>{pendingReviewPages.slice(0, 4).map((page) => `第 ${pages.findIndex((candidate) => candidate.id === page.id) + 1} 页（${page.reviewReasons.map((reason) => reviewReasonLabel[reason]).join('、')}）`).join('；')}{pendingReviewPages.length > 4 ? `；另有 ${pendingReviewPages.length - 4} 页` : ''}</span><button onClick={() => onReviewPage(pendingReviewPages[0].id)}>返回检查第 {pages.findIndex((page) => page.id === pendingReviewPages[0].id) + 1} 页</button></div></div>}<label>文件名<input value={settings.filename} maxLength={80} onChange={(event) => onChange({ ...settings, filename: event.target.value })} /></label><fieldset><legend>清晰度</legend><div className="quality-options">{([['clear','清晰','适合打印'],['standard','标准','推荐'],['small','小文件','适合分享']] as const).map(([value,label,help]) => <button key={value} className={settings.quality === value ? 'active' : ''} onClick={() => onChange({ ...settings, quality: value })}><strong>{label}</strong><small>{help}</small></button>)}</div></fieldset><label>页边距<select value={settings.margin} onChange={(event) => onChange({ ...settings, margin: Number(event.target.value) as ExportSettings['margin'] })}><option value={6}>窄（6 mm）</option><option value={12}>标准（12 mm）</option><option value={18}>宽（18 mm）</option></select></label><div className="export-safe"><ShieldCheck /><span>PDF 在浏览器本地生成，不会上传图片</span></div></div></div>{progress > 0 && <div className="export-progress"><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>正在生成 {progress}%</span></div>}<div className="modal-actions"><button className="secondary" onClick={onClose} disabled={progress > 0}>取消</button><button className="primary" onClick={onExport} disabled={progress > 0}><Download />{progress > 0 ? '正在生成…' : pendingReviewPages.length > 0 ? '仍然下载 PDF' : '下载 PDF'}</button></div></div></div>
 }
 
 function useDialogFocus(onClose: () => void) {

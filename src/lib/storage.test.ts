@@ -19,6 +19,9 @@ const basePage: WorksheetPage = {
   progress: 100,
   rotation: 0,
   autoRotation: 0,
+  enhancementPreset: 'clear',
+  reviewReasons: ['boundary'],
+  reviewConfirmed: false,
   corners: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }],
   processingStage: 'compositing',
   enhanced: baseline,
@@ -27,6 +30,8 @@ const basePage: WorksheetPage = {
     autoRotation: 0,
     effectiveRotation: 0,
     orientationConfidence: 0.9,
+    orientationMargin: 0.7,
+    orientationAccepted: true,
     boundaryConfidence: 0.9,
     boundaryAccepted: true,
     orientationBackend: 'wasm',
@@ -58,14 +63,18 @@ describe('task storage migration', () => {
     await clearTask()
   })
 
-  it('persists v3 orientation diagnostics and source preview', async () => {
-    await saveTask([basePage])
+  it('persists v4 enhancement and orientation diagnostics', async () => {
+    await saveTask([basePage], 'highContrast')
     const restored = await loadTask()
-    expect(restored[0]).toMatchObject({
+    expect(restored.defaultEnhancementPreset).toBe('highContrast')
+    expect(restored.pages[0]).toMatchObject({
       sourcePreview: basePage.sourcePreview,
       autoRotation: 0,
       processingStage: 'compositing',
-      diagnostics: { boundaryAccepted: true, orientationBackend: 'wasm' },
+      enhancementPreset: 'clear',
+      reviewReasons: ['boundary'],
+      reviewConfirmed: false,
+      diagnostics: { boundaryAccepted: true, orientationBackend: 'wasm', orientationMargin: 0.7 },
     })
   })
 
@@ -86,9 +95,28 @@ describe('task storage migration', () => {
       reviewMask: new Blob(['review']),
     })
     const restored = await loadTask()
-    expect(restored[0].processed).toBe(restored[0].enhanced)
-    expect(restored[0].status).toBe('ready')
-    expect(restored[0].diagnostics.orientationBackend).toBe('unavailable')
+    expect(restored.pages[0].processed).toBe(restored.pages[0].enhanced)
+    expect(restored.pages[0].status).toBe('ready')
+    expect(restored.pages[0].enhancementPreset).toBe('soft')
+    expect(restored.defaultEnhancementPreset).toBe('soft')
+    expect(restored.pages[0].diagnostics.orientationBackend).toBe('unavailable')
+  })
+
+  it('preserves the processed image while migrating a v3 task to soft enhancement', async () => {
+    const processed = new Blob(['v3-processed'], { type: 'image/jpeg' })
+    await putLegacyTask({
+      ...basePage,
+      sourceUrl: undefined,
+      sourcePreviewUrl: undefined,
+      enhancedUrl: undefined,
+      processedUrl: undefined,
+      processed,
+    }, 3)
+    const restored = await loadTask()
+    expect(restored.pages[0].processed).not.toBe(restored.pages[0].enhanced)
+    expect(restored.pages[0].processed).toBeTruthy()
+    expect(restored.pages[0].enhancementPreset).toBe('soft')
+    expect(restored.pages[0].diagnostics.orientationBackend).toBe('wasm')
   })
 
   it('queues a v2 task for reprocessing when no enhanced baseline exists', async () => {
@@ -97,7 +125,7 @@ describe('task storage migration', () => {
     void _processed
     await putLegacyTask({ ...legacy, sourceUrl: undefined, sourcePreviewUrl: undefined })
     const restored = await loadTask()
-    expect(restored[0]).toMatchObject({
+    expect(restored.pages[0]).toMatchObject({
       status: 'queued',
       processingStage: 'queued',
       error: '旧任务缺少未擦除基线，正在从原图重新处理',

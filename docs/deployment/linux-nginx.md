@@ -79,7 +79,7 @@ sudo systemctl reload nginx
 
 ```bash
 curl -I https://exam.example.com/
-curl -I https://exam.example.com/models/document-orientation.int8.onnx
+curl -I https://exam.example.com/models/pp-lcnet-x1-doc-orientation.onnx
 curl -I https://exam.example.com/assets/ort-wasm-simd-threaded.jsep-*.wasm
 ```
 
